@@ -23,10 +23,19 @@ import "admin-lte/plugins/datatables-buttons/js/dataTables.buttons";
 import "admin-lte/plugins/datatables-buttons/js/buttons.bootstrap4";
 import "admin-lte/plugins/datatables-buttons/js/buttons.html5";
 import "admin-lte/plugins/datatables-buttons/js/buttons.colVis";
+import "admin-lte/plugins/datatables-rowgroup/js/dataTables.rowGroup";
+import "admin-lte/plugins/datatables-rowgroup/js/rowGroup.bootstrap4";
 
 // Import AdminLTE JS
 import "admin-lte/build/js/AdminLTE";
 
+// Get our timeago function
+import timeAgo from "warehouse/utils/timeago";
+
+// Human-readable timestamps
+$(document).ready(function() {
+  timeAgo();
+});
 
 document.querySelectorAll("a[data-form-submit]").forEach(function (element) {
   element.addEventListener("click", function(event) {
@@ -94,13 +103,18 @@ document.querySelectorAll(".btn-group[data-input][data-state]").forEach(function
 
 // Copy handler for copying text, e.g.
 //   - prohibited project names confirmation page
+//   - user account recoveries
 //
 document.querySelectorAll(".copy-text").forEach(function (element) {
-  function copy(text, target) {
+  $(element).tooltip({ title: "Click to copy!" });
+  function copy(text) {
     setTimeout(function () {
-      $("#copied_tip").remove();
+      $(element).tooltip("hide")
+        .attr("data-original-title", "Click to copy!");
     }, 1000);
-    $(target).append("<div class='tip' id='copied_tip'>Copied!</div>");
+    $(element).tooltip("hide")
+      .attr("data-original-title", "Copied!")
+      .tooltip("show");
     navigator.clipboard.writeText(text);
   }
 
@@ -111,25 +125,105 @@ document.querySelectorAll(".copy-text").forEach(function (element) {
 });
 
 // Activate Datatables https://datatables.net/
+// Guard each one to not break execution if the table isn't present
+
 // User Account Activity
-let table = $("#account-activity").DataTable({
-  responsive: true,
-  lengthChange: false,
-});
-// sort by time
-table.column(".time").order("desc").draw();
-// Hide some columns we don't need to see all the time
-table.columns([".ip_address", ".hashed_ip"]).visible(false);
-// add column visibility button
-new $.fn.dataTable.Buttons(table, {buttons: ["copy", "csv", "colvis"]});
-table.buttons().container().appendTo($(".col-md-6:eq(0)", table.table().container()));
+let accountActivityTable = $("#account-activity");
+if (accountActivityTable.length) {
+  let table = accountActivityTable.DataTable({
+    responsive: true,
+    lengthChange: false,
+  });
+  // sort by time
+  table.column(".time").order("desc").draw();
+  // Hide some columns we don't need to see all the time
+  table.columns([".ip_address", ".hashed_ip"]).visible(false);
+  // add column visibility button
+  new $.fn.dataTable.Buttons(table, {buttons: ["copy", "csv", "colvis"]});
+  table.buttons().container().appendTo($(".col-md-6:eq(0)", table.table().container()));
+}
+
+// User API Tokens
+let tokenTable = $("#api-tokens");
+if (tokenTable.length) {
+  let table = tokenTable.DataTable({
+    responsive: true,
+    lengthChange: false,
+  });
+  table.columns([".last_used", ".created"]).order([1, "desc"]).draw();
+  table.columns([".permissions_caveat"]).visible(false);
+  new $.fn.dataTable.Buttons(table, {buttons: ["colvis"]});
+  table.buttons().container().appendTo($(".col-md-6:eq(0)", table.table().container()));
+}
 
 // Observations
-let obs_table = $("#observations").DataTable({
-  responsive: true,
-  lengthChange: false,
+let observationsTable = $("#observations");
+if (observationsTable.length) {
+  let table = observationsTable.DataTable({
+    responsive: true,
+    lengthChange: false,
+  });
+  table.column(".time").order("desc").draw();
+  table.columns([".payload"]).visible(false);
+  new $.fn.dataTable.Buttons(table, {buttons: ["copy", "csv", "colvis"]});
+  table.buttons().container().appendTo($(".col-md-6:eq(0)", table.table().container()));
+}
+
+// Malware Reports
+let malwareReportsTable = $("#malware-reports");
+if (malwareReportsTable.length) {
+  let table = malwareReportsTable.DataTable({
+    displayLength: 25,
+    lengthChange: false,
+    order: [[0, "asc"], [2, "desc"]],  // alpha name, recent date
+    responsive: true,
+    rowGroup: {
+      dataSrc: 0,
+      // display row count in group header
+      startRender: function (rows, group) {
+        return group + " (" + rows.count() + ")";
+      },
+    },
+  });
+  // hide the project name, since it's in the group title
+  table.columns([0]).visible(false);
+  new $.fn.dataTable.Buttons(table, {buttons: ["copy", "csv", "colvis"]});
+  table.buttons().container().appendTo($(".col-md-6:eq(0)", table.table().container()));
+}
+
+// Link Checking
+const links = document.querySelectorAll("a[data-check-link-url]");
+links.forEach(function(link){
+  let reportLine = {bareUrl: link.href, url: link.dataset.checkLinkUrl, status:0, element : link};
+  fetch(reportLine.url, {
+    method: "GET",
+    mode: "cors",
+  })
+    .then(function(response) {
+      let responseText = "";
+      response.text().then((text) => {
+        responseText = text;
+        console.log(response.status, responseText);
+        if (response.status === 400 && responseText === "Unsupported content-type returned\n") {
+          reportLine.element.firstChild.classList.remove("fa-question");
+          reportLine.element.firstChild.classList.add("fa-check");
+          reportLine.element.firstChild.classList.add("text-green");
+          reportLine.status = 1;
+        } else {
+          reportLine.status = 0;
+          reportLine.element.firstChild.classList.remove("fa-question");
+          reportLine.element.firstChild.classList.add("fa-times");
+          reportLine.element.firstChild.classList.add("text-red");
+        }
+        console.log(reportLine);
+      });
+    })
+    .catch(function(error) {
+      reportLine.status = -1;
+      console.log(error);
+      console.log(reportLine);
+      reportLine.element.firstChild.classList.remove("fa-question");
+      reportLine.element.firstChild.classList.add("fa-times");
+      reportLine.element.firstChild.classList.add("text-red");
+    });
 });
-obs_table.column(".time").order("desc").draw();
-obs_table.columns([".payload"]).visible(false);
-new $.fn.dataTable.Buttons(obs_table, {buttons: ["copy", "csv", "colvis"]});
-obs_table.buttons().container().appendTo($(".col-md-6:eq(0)", obs_table.table().container()));

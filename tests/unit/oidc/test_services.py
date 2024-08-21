@@ -9,6 +9,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import datetime
 
 import jwt
 import pretend
@@ -22,6 +23,7 @@ import warehouse.utils.exceptions
 
 from tests.common.db.oidc import GitHubPublisherFactory, PendingGitHubPublisherFactory
 from warehouse.oidc import errors, interfaces, services
+from warehouse.oidc.interfaces import SignedClaims
 
 
 def test_oidc_publisher_service_factory(metrics):
@@ -88,16 +90,16 @@ class TestOIDCPublisherService:
         assert jwt.decode.calls == [
             pretend.call(
                 token,
-                key=key.key,
+                key=key,
                 algorithms=["RS256"],
                 options=dict(
                     verify_signature=True,
-                    require=["iss", "iat", "nbf", "exp", "aud"],
+                    require=["iss", "iat", "exp", "aud"],
                     verify_iss=True,
                     verify_iat=True,
-                    verify_nbf=True,
                     verify_exp=True,
                     verify_aud=True,
+                    verify_nbf=True,
                     strict_aud=True,
                 ),
                 issuer=service.issuer_url,
@@ -106,10 +108,7 @@ class TestOIDCPublisherService:
             )
         ]
 
-    @pytest.mark.parametrize("exc", [DecodeError, TypeError("foo")])
-    def test_verify_jwt_signature_get_key_for_token_fails(
-        self, metrics, monkeypatch, exc
-    ):
+    def test_verify_jwt_signature_get_key_for_token_fails(self, metrics, monkeypatch):
         service = services.OIDCPublisherService(
             session=pretend.stub(),
             publisher="fakepublisher",
@@ -120,8 +119,8 @@ class TestOIDCPublisherService:
         )
 
         token = pretend.stub()
-        jwt = pretend.stub(decode=pretend.raiser(exc), PyJWTError=PyJWTError)
-        monkeypatch.setattr(service, "_get_key_for_token", pretend.raiser(exc))
+        jwt = pretend.stub(PyJWTError=PyJWTError)
+        monkeypatch.setattr(service, "_get_key_for_token", pretend.raiser(DecodeError))
         monkeypatch.setattr(services, "jwt", jwt)
         monkeypatch.setattr(
             services.sentry_sdk,
@@ -136,13 +135,7 @@ class TestOIDCPublisherService:
                 tags=["publisher:fakepublisher"],
             )
         ]
-
-        if exc != DecodeError:
-            assert services.sentry_sdk.capture_message.calls == [
-                pretend.call(f"JWT backend raised generic error: {exc}")
-            ]
-        else:
-            assert services.sentry_sdk.capture_message.calls == []
+        assert services.sentry_sdk.capture_message.calls == []
 
     @pytest.mark.parametrize("exc", [PyJWTError, TypeError("foo")])
     def test_verify_jwt_signature_fails(self, metrics, monkeypatch, exc):
@@ -193,9 +186,9 @@ class TestOIDCPublisherService:
             metrics=metrics,
         )
 
-        token = pretend.stub()
+        token = SignedClaims({})
 
-        publisher = pretend.stub(verify_claims=pretend.call_recorder(lambda c: True))
+        publisher = pretend.stub(verify_claims=pretend.call_recorder(lambda c, s: True))
         find_publisher_by_issuer = pretend.call_recorder(lambda *a, **kw: publisher)
         monkeypatch.setattr(
             services, "find_publisher_by_issuer", find_publisher_by_issuer
@@ -262,7 +255,7 @@ class TestOIDCPublisherService:
             services, "find_publisher_by_issuer", find_publisher_by_issuer
         )
 
-        claims = pretend.stub()
+        claims = SignedClaims({})
         with pytest.raises(errors.InvalidPublisherError):
             service.find_publisher(claims)
         assert service.metrics.increment.calls == [
@@ -275,7 +268,45 @@ class TestOIDCPublisherService:
                 tags=["publisher:fakepublisher"],
             ),
         ]
-        assert publisher.verify_claims.calls == [pretend.call(claims)]
+        assert publisher.verify_claims.calls == [pretend.call(claims, service)]
+
+    def test_find_publisher_reuse_token_fails(self, monkeypatch, mockredis, metrics):
+        service = services.OIDCPublisherService(
+            session=pretend.stub(),
+            publisher="fakepublisher",
+            issuer_url=pretend.stub(),
+            audience="fakeaudience",
+            cache_url="redis://fake.example.com",
+            metrics=metrics,
+        )
+
+        publisher = pretend.stub(
+            verify_claims=pretend.call_recorder(pretend.raiser(errors.ReusedTokenError))
+        )
+        find_publisher_by_issuer = pretend.call_recorder(lambda *a, **kw: publisher)
+        monkeypatch.setattr(
+            services, "find_publisher_by_issuer", find_publisher_by_issuer
+        )
+
+        expiration = int(
+            (
+                datetime.datetime.now(tz=datetime.UTC) + datetime.timedelta(minutes=15)
+            ).timestamp()
+        )
+
+        claims = SignedClaims(
+            {
+                "iss": "foo",
+                "iat": 1516239022,
+                "nbf": 1516239022,
+                "exp": expiration,
+                "aud": "pypi",
+                "jti": "fake-token-identifier",
+            }
+        )
+
+        with pytest.raises(errors.ReusedTokenError):
+            service.find_publisher(claims, pending=False)
 
     def test_get_keyset_not_cached(self, monkeypatch, mockredis):
         service = services.OIDCPublisherService(
@@ -697,6 +728,44 @@ class TestOIDCPublisherService:
         assert pending_publisher.reify.calls == [pretend.call(service.db)]
         assert project.oidc_publishers == [publisher]
 
+    def test_jwt_identifier_exists(self, metrics, mockredis, monkeypatch):
+        service = services.OIDCPublisherService(
+            session=pretend.stub(),
+            publisher="fakepublisher",
+            issuer_url=pretend.stub(),
+            audience="fakeaudience",
+            cache_url="redis://fake.example.com",
+            metrics=metrics,
+        )
+
+        monkeypatch.setattr(services.redis, "StrictRedis", mockredis)
+
+        assert service.jwt_identifier_exists("fake-jti-token") is False
+
+    def test_jwt_identifier_exists_find_duplicate(
+        self, metrics, mockredis, monkeypatch
+    ):
+        service = services.OIDCPublisherService(
+            session=pretend.stub(),
+            publisher="fakepublisher",
+            issuer_url=pretend.stub(),
+            audience="fakeaudience",
+            cache_url="redis://fake.example.com",
+            metrics=metrics,
+        )
+
+        monkeypatch.setattr(services.redis, "StrictRedis", mockredis)
+
+        expiration = int(
+            (
+                datetime.datetime.now(tz=datetime.UTC) + datetime.timedelta(minutes=15)
+            ).timestamp()
+        )
+        jwt_identifier = "6e67b1cb-2b8d-4be5-91cb-757edb2ec970"
+        service.store_jwt_identifier(jwt_identifier, expiration=expiration)
+
+        assert service.jwt_identifier_exists(jwt_identifier) is True
+
 
 class TestNullOIDCPublisherService:
     def test_interface_matches(self):
@@ -823,13 +892,16 @@ class TestNullOIDCPublisherService:
         assert service.verify_jwt_signature(jwt) is None
 
     def test_find_publisher(self, monkeypatch):
-        claims = {
-            "iss": "foo",
-            "iat": 1516239022,
-            "nbf": 1516239022,
-            "exp": 9999999999,
-            "aud": "pypi",
-        }
+        claims = SignedClaims(
+            {
+                "iss": "foo",
+                "iat": 1516239022,
+                "nbf": 1516239022,
+                "exp": 9999999999,
+                "aud": "pypi",
+                "jti": "6e67b1cb-2b8d-4be5-91cb-757edb2ec970",
+            }
+        )
 
         service = services.NullOIDCPublisherService(
             session=pretend.stub(),
@@ -840,7 +912,7 @@ class TestNullOIDCPublisherService:
             metrics=pretend.stub(),
         )
 
-        publisher = pretend.stub(verify_claims=pretend.call_recorder(lambda c: True))
+        publisher = pretend.stub(verify_claims=pretend.call_recorder(lambda c, s: True))
         find_publisher_by_issuer = pretend.call_recorder(lambda *a, **kw: publisher)
         monkeypatch.setattr(
             services, "find_publisher_by_issuer", find_publisher_by_issuer
@@ -848,7 +920,7 @@ class TestNullOIDCPublisherService:
 
         assert service.find_publisher(claims) == publisher
 
-    def test_find_publisher_full_pending(self, oidc_service):
+    def test_find_publisher_full_pending(self, github_oidc_service):
         pending_publisher = PendingGitHubPublisherFactory.create(
             project_name="does-not-exist",
             repository_name="bar",
@@ -886,10 +958,12 @@ class TestNullOIDCPublisherService:
             "iat": 1650663865,
         }
 
-        expected_pending_publisher = oidc_service.find_publisher(claims, pending=True)
+        expected_pending_publisher = github_oidc_service.find_publisher(
+            claims, pending=True
+        )
         assert expected_pending_publisher == pending_publisher
 
-    def test_find_publisher_full(self, oidc_service):
+    def test_find_publisher_full(self, github_oidc_service):
         publisher = GitHubPublisherFactory.create(
             repository_name="bar",
             repository_owner="foo",
@@ -926,7 +1000,7 @@ class TestNullOIDCPublisherService:
             "iat": 1650663865,
         }
 
-        expected_publisher = oidc_service.find_publisher(claims, pending=False)
+        expected_publisher = github_oidc_service.find_publisher(claims, pending=False)
         assert expected_publisher == publisher
 
     def test_reify_publisher(self):
@@ -950,6 +1024,30 @@ class TestNullOIDCPublisherService:
         assert service.reify_pending_publisher(pending_publisher, project) == publisher
         assert pending_publisher.reify.calls == [pretend.call(service.db)]
         assert project.oidc_publishers == [publisher]
+
+    def test_jwt_identifier_exists(self):
+        service = services.NullOIDCPublisherService(
+            session=pretend.stub(),
+            publisher="example",
+            issuer_url="https://example.com",
+            audience="fakeaudience",
+            cache_url="rediss://fake.example.com",
+            metrics=pretend.stub(),
+        )
+
+        assert service.jwt_identifier_exists(pretend.stub()) is False
+
+    def test_store_jwt_identifier(self):
+        service = services.NullOIDCPublisherService(
+            session=pretend.stub(),
+            publisher="example",
+            issuer_url="https://example.com",
+            audience="fakeaudience",
+            cache_url="rediss://fake.example.com",
+            metrics=pretend.stub(),
+        )
+
+        assert service.store_jwt_identifier(pretend.stub(), pretend.stub()) is None
 
 
 class TestPyJWTBackstop:
@@ -979,15 +1077,14 @@ class TestPyJWTBackstop:
 
         assert decoded == {"foo": "bar"}
 
-    def test_decodes_token_typeerror_on_pyjwk(self):
+    def test_decodes_token_pyjwk(self):
         privkey_jwk = PyJWK.from_json(algorithms.RSAAlgorithm.to_jwk(self._privkey))
         pubkey_jwk = PyJWK.from_json(algorithms.RSAAlgorithm.to_jwk(self._pubkey))
 
         token = jwt.encode({"foo": "bar"}, privkey_jwk.key, algorithm="RS256")
+        decoded = jwt.decode(token, pubkey_jwk, algorithms=["RS256"])
 
-        # Passing a `PyJWK` directly into `jwt.decode` does not work.
-        with pytest.raises(TypeError, match=r"Expecting a PEM-formatted key\."):
-            jwt.decode(token, pubkey_jwk, algorithms=["RS256"])
+        assert decoded == {"foo": "bar"}
 
     def test_decode_strict_aud(self):
         token = jwt.encode(

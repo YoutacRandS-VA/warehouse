@@ -21,7 +21,6 @@ from webob.multidict import MultiDict
 
 import warehouse.utils.otp as otp
 
-from warehouse import recaptcha
 from warehouse.accounts import forms
 from warehouse.accounts.interfaces import (
     BurnedRecoveryCode,
@@ -29,7 +28,8 @@ from warehouse.accounts.interfaces import (
     NoRecoveryCodes,
     TooManyFailedLogins,
 )
-from warehouse.accounts.models import DisableReason
+from warehouse.accounts.models import DisableReason, ProhibitedEmailDomain
+from warehouse.captcha import recaptcha
 from warehouse.events.tags import EventTag
 from warehouse.utils.webauthn import AuthenticationRejectedError
 
@@ -78,18 +78,27 @@ class TestLoginForm:
 
         assert user_service.find_userid.calls == [pretend.call("my_username")]
 
-    def test_validate_username_with_user(self):
+    @pytest.mark.parametrize(
+        "input_username,expected_username",
+        [
+            ("my_username", "my_username"),
+            ("  my_username  ", "my_username"),
+            ("my_username ", "my_username"),
+            (" my_username", "my_username"),
+            ("   my_username    ", "my_username"),
+        ],
+    )
+    def test_validate_username_with_user(self, input_username, expected_username):
         request = pretend.stub()
         user_service = pretend.stub(find_userid=pretend.call_recorder(lambda userid: 1))
         breach_service = pretend.stub()
         form = forms.LoginForm(
             request=request, user_service=user_service, breach_service=breach_service
         )
-        field = pretend.stub(data="my_username")
-
+        field = pretend.stub(data=input_username)
         form.validate_username(field)
 
-        assert user_service.find_userid.calls == [pretend.call("my_username")]
+        assert user_service.find_userid.calls == [pretend.call(expected_username)]
 
     def test_validate_password_no_user(self):
         request = pretend.stub(
@@ -374,7 +383,7 @@ class TestLoginForm:
 
 class TestRegistrationForm:
     def test_validate(self):
-        recaptcha_service = pretend.stub(
+        captcha_service = pretend.stub(
             enabled=False,
             verify_response=pretend.call_recorder(lambda _: None),
         )
@@ -390,6 +399,9 @@ class TestRegistrationForm:
         )
 
         form = forms.RegistrationForm(
+            request=pretend.stub(
+                db=pretend.stub(query=lambda *a: pretend.stub(scalar=lambda: False))
+            ),
             formdata=MultiDict(
                 {
                     "username": "myusername",
@@ -400,21 +412,22 @@ class TestRegistrationForm:
                 }
             ),
             user_service=user_service,
-            recaptcha_service=recaptcha_service,
+            captcha_service=captcha_service,
             breach_service=breach_service,
         )
 
         assert form.user_service is user_service
-        assert form.recaptcha_service is recaptcha_service
+        assert form.captcha_service is captcha_service
         assert form.validate(), str(form.errors)
 
     def test_password_confirm_required_error(self):
         form = forms.RegistrationForm(
+            request=pretend.stub(),
             formdata=MultiDict({"password_confirm": ""}),
             user_service=pretend.stub(
                 find_userid_by_email=pretend.call_recorder(lambda _: pretend.stub())
             ),
-            recaptcha_service=pretend.stub(enabled=True),
+            captcha_service=pretend.stub(enabled=True),
             breach_service=pretend.stub(check_password=lambda pw: False),
         )
 
@@ -426,11 +439,12 @@ class TestRegistrationForm:
             find_userid_by_email=pretend.call_recorder(lambda _: pretend.stub())
         )
         form = forms.RegistrationForm(
+            request=pretend.stub(),
             formdata=MultiDict(
                 {"new_password": "password", "password_confirm": "mismatch"}
             ),
             user_service=user_service,
-            recaptcha_service=pretend.stub(enabled=True),
+            captcha_service=pretend.stub(enabled=True),
             breach_service=pretend.stub(check_password=lambda pw, tags=None: False),
         )
 
@@ -445,6 +459,7 @@ class TestRegistrationForm:
             find_userid_by_email=pretend.call_recorder(lambda _: pretend.stub())
         )
         form = forms.RegistrationForm(
+            request=pretend.stub(),
             formdata=MultiDict(
                 {
                     "new_password": "MyStr0ng!shPassword",
@@ -452,7 +467,7 @@ class TestRegistrationForm:
                 }
             ),
             user_service=user_service,
-            recaptcha_service=pretend.stub(enabled=True),
+            captcha_service=pretend.stub(enabled=True),
             breach_service=pretend.stub(check_password=lambda pw, tags=None: False),
         )
 
@@ -462,11 +477,12 @@ class TestRegistrationForm:
 
     def test_email_required_error(self):
         form = forms.RegistrationForm(
+            request=pretend.stub(),
             formdata=MultiDict({"email": ""}),
             user_service=pretend.stub(
                 find_userid_by_email=pretend.call_recorder(lambda _: pretend.stub())
             ),
-            recaptcha_service=pretend.stub(enabled=True),
+            captcha_service=pretend.stub(enabled=True),
             breach_service=pretend.stub(check_password=lambda pw, tags=None: False),
         )
 
@@ -474,13 +490,14 @@ class TestRegistrationForm:
         assert form.email.errors.pop() == "This field is required."
 
     @pytest.mark.parametrize("email", ["bad", "foo]bar@example.com", "</body></html>"])
-    def test_invalid_email_error(self, pyramid_config, email):
+    def test_invalid_email_error(self, pyramid_request, email):
         form = forms.RegistrationForm(
+            request=pyramid_request,
             formdata=MultiDict({"email": email}),
             user_service=pretend.stub(
                 find_userid_by_email=pretend.call_recorder(lambda _: None)
             ),
-            recaptcha_service=pretend.stub(enabled=True),
+            captcha_service=pretend.stub(enabled=True),
             breach_service=pretend.stub(check_password=lambda pw, tags=None: False),
         )
 
@@ -491,24 +508,31 @@ class TestRegistrationForm:
 
     def test_exotic_email_success(self):
         form = forms.RegistrationForm(
+            request=pretend.stub(
+                db=pretend.stub(query=lambda *a: pretend.stub(scalar=lambda: False))
+            ),
             formdata=MultiDict({"email": "foo@n--tree.net"}),
             user_service=pretend.stub(
                 find_userid_by_email=pretend.call_recorder(lambda _: None)
             ),
-            recaptcha_service=pretend.stub(enabled=True),
+            captcha_service=pretend.stub(enabled=True),
             breach_service=pretend.stub(check_password=lambda pw, tags=None: False),
         )
 
         form.validate()
         assert len(form.email.errors) == 0
 
-    def test_email_exists_error(self, pyramid_config):
+    def test_email_exists_error(self, pyramid_request):
+        pyramid_request.db = pretend.stub(
+            query=lambda *a: pretend.stub(scalar=lambda: False)
+        )
         form = forms.RegistrationForm(
+            request=pyramid_request,
             formdata=MultiDict({"email": "foo@bar.com"}),
             user_service=pretend.stub(
                 find_userid_by_email=pretend.call_recorder(lambda _: pretend.stub())
             ),
-            recaptcha_service=pretend.stub(enabled=True),
+            captcha_service=pretend.stub(enabled=True),
             breach_service=pretend.stub(check_password=lambda pw, tags=None: False),
         )
 
@@ -519,13 +543,14 @@ class TestRegistrationForm:
             "Use a different email."
         )
 
-    def test_prohibited_email_error(self, pyramid_config):
+    def test_disposable_email_error(self, pyramid_request):
         form = forms.RegistrationForm(
+            request=pyramid_request,
             formdata=MultiDict({"email": "foo@bearsarefuzzy.com"}),
             user_service=pretend.stub(
                 find_userid_by_email=pretend.call_recorder(lambda _: None)
             ),
-            recaptcha_service=pretend.stub(enabled=True),
+            captcha_service=pretend.stub(enabled=True),
             breach_service=pretend.stub(check_password=lambda pw, tags=None: False),
         )
 
@@ -536,11 +561,43 @@ class TestRegistrationForm:
             "different email."
         )
 
+    @pytest.mark.parametrize(
+        "email",
+        [
+            "foo@wutang.net",
+            "foo@clan.wutang.net",
+            "foo@one.two.wutang.net",
+            "foo@wUtAnG.net",
+        ],
+    )
+    def test_prohibited_email_error(self, db_request, email):
+        domain = ProhibitedEmailDomain(domain="wutang.net")
+        db_request.db.add(domain)
+
+        form = forms.RegistrationForm(
+            request=db_request,
+            formdata=MultiDict({"email": email}),
+            user_service=pretend.stub(
+                find_userid_by_email=pretend.call_recorder(lambda _: None)
+            ),
+            captcha_service=pretend.stub(enabled=True),
+            breach_service=pretend.stub(check_password=lambda pw, tags=None: False),
+        )
+
+        assert not form.validate()
+        assert form.email.errors
+        assert (
+            str(form.email.errors.pop())
+            == "You can't use an email address from this domain. Use a "
+            "different email."
+        )
+
     def test_recaptcha_disabled(self):
         form = forms.RegistrationForm(
+            request=pretend.stub(),
             formdata=MultiDict({"g_recpatcha_response": ""}),
             user_service=pretend.stub(),
-            recaptcha_service=pretend.stub(
+            captcha_service=pretend.stub(
                 enabled=False,
                 verify_response=pretend.call_recorder(lambda _: None),
             ),
@@ -553,9 +610,10 @@ class TestRegistrationForm:
 
     def test_recaptcha_required_error(self):
         form = forms.RegistrationForm(
+            request=pretend.stub(),
             formdata=MultiDict({"g_recaptcha_response": ""}),
             user_service=pretend.stub(),
-            recaptcha_service=pretend.stub(
+            captcha_service=pretend.stub(
                 enabled=True,
                 verify_response=pretend.call_recorder(lambda _: None),
             ),
@@ -566,9 +624,10 @@ class TestRegistrationForm:
 
     def test_recaptcha_error(self):
         form = forms.RegistrationForm(
+            request=pretend.stub(),
             formdata=MultiDict({"g_recaptcha_response": "asd"}),
             user_service=pretend.stub(),
-            recaptcha_service=pretend.stub(
+            captcha_service=pretend.stub(
                 verify_response=pretend.raiser(recaptcha.RecaptchaError),
                 enabled=True,
             ),
@@ -579,12 +638,13 @@ class TestRegistrationForm:
 
     def test_username_exists(self, pyramid_config):
         form = forms.RegistrationForm(
+            request=pretend.stub(),
             formdata=MultiDict({"username": "foo"}),
             user_service=pretend.stub(
                 find_userid=pretend.call_recorder(lambda name: 1),
                 username_is_prohibited=lambda a: False,
             ),
-            recaptcha_service=pretend.stub(
+            captcha_service=pretend.stub(
                 enabled=False,
                 verify_response=pretend.call_recorder(lambda _: None),
             ),
@@ -599,11 +659,12 @@ class TestRegistrationForm:
 
     def test_username_prohibted(self, pyramid_config):
         form = forms.RegistrationForm(
+            request=pretend.stub(),
             formdata=MultiDict({"username": "foo"}),
             user_service=pretend.stub(
                 username_is_prohibited=lambda a: True,
             ),
-            recaptcha_service=pretend.stub(
+            captcha_service=pretend.stub(
                 enabled=False,
                 verify_response=pretend.call_recorder(lambda _: None),
             ),
@@ -619,12 +680,13 @@ class TestRegistrationForm:
     @pytest.mark.parametrize("username", ["_foo", "bar_", "foo^bar", "boo\0far"])
     def test_username_is_valid(self, username, pyramid_config):
         form = forms.RegistrationForm(
+            request=pretend.stub(),
             formdata=MultiDict({"username": username}),
             user_service=pretend.stub(
                 find_userid=pretend.call_recorder(lambda _: None),
                 username_is_prohibited=lambda a: False,
             ),
-            recaptcha_service=pretend.stub(
+            captcha_service=pretend.stub(
                 enabled=False,
                 verify_response=pretend.call_recorder(lambda _: None),
             ),
@@ -647,9 +709,10 @@ class TestRegistrationForm:
         )
         for pwd, valid in cases:
             form = forms.RegistrationForm(
+                request=pretend.stub(),
                 formdata=MultiDict({"new_password": pwd, "password_confirm": pwd}),
                 user_service=pretend.stub(),
-                recaptcha_service=pretend.stub(
+                captcha_service=pretend.stub(
                     enabled=False,
                     verify_response=pretend.call_recorder(lambda _: None),
                 ),
@@ -660,11 +723,12 @@ class TestRegistrationForm:
 
     def test_password_breached(self):
         form = forms.RegistrationForm(
+            request=pretend.stub(),
             formdata=MultiDict({"new_password": "password"}),
             user_service=pretend.stub(
                 find_userid=pretend.call_recorder(lambda _: None)
             ),
-            recaptcha_service=pretend.stub(
+            captcha_service=pretend.stub(
                 enabled=False,
                 verify_response=pretend.call_recorder(lambda _: None),
             ),
@@ -684,11 +748,12 @@ class TestRegistrationForm:
 
     def test_name_too_long(self, pyramid_config):
         form = forms.RegistrationForm(
+            request=pretend.stub(),
             formdata=MultiDict({"full_name": "hello " * 50}),
             user_service=pretend.stub(
                 find_userid=pretend.call_recorder(lambda _: None)
             ),
-            recaptcha_service=pretend.stub(
+            captcha_service=pretend.stub(
                 enabled=False,
                 verify_response=pretend.call_recorder(lambda _: None),
             ),
@@ -700,56 +765,49 @@ class TestRegistrationForm:
             == "The name is too long. Choose a name with 100 characters or less."
         )
 
+    def test_name_contains_null_bytes(self, pyramid_config):
+        form = forms.RegistrationForm(
+            request=pretend.stub(),
+            formdata=MultiDict({"full_name": "hello\0world"}),
+            user_service=pretend.stub(
+                find_userid=pretend.call_recorder(lambda _: None)
+            ),
+            captcha_service=pretend.stub(
+                enabled=False,
+                verify_response=pretend.call_recorder(lambda _: None),
+            ),
+            breach_service=pretend.stub(check_password=lambda pw, tags=None: True),
+        )
+        assert not form.validate()
+        assert form.full_name.errors.pop() == "Null bytes are not allowed."
+
 
 class TestRequestPasswordResetForm:
-    def test_validate(self):
-        user_service = pretend.stub(
-            get_user_by_username=pretend.call_recorder(lambda userid: "1")
-        )
+    @pytest.mark.parametrize(
+        "form_input",
+        [
+            "username",
+            "foo@bar.net",
+        ],
+    )
+    def test_validate(self, form_input):
         form = forms.RequestPasswordResetForm(
-            formdata=MultiDict({"username_or_email": "foo@bar.net"}),
-            user_service=user_service,
+            request=pretend.stub(),
+            formdata=MultiDict({"username_or_email": form_input}),
         )
-        assert form.user_service is user_service
-        assert form.validate(), str(form.errors)
+        assert form.validate()
 
     def test_no_password_field(self):
-        user_service = pretend.stub()
-        form = forms.RequestPasswordResetForm(user_service=user_service)
+        form = forms.RequestPasswordResetForm()
         assert "password" not in form._fields
 
-    def test_validate_username_or_email(self):
-        user_service = pretend.stub(
-            get_user_by_username=pretend.call_recorder(lambda userid: "1"),
-            get_user_by_email=pretend.call_recorder(lambda userid: "1"),
-        )
-        form = forms.RequestPasswordResetForm(user_service=user_service)
-        field = pretend.stub(data="username_or_email")
-
-        form.validate_username_or_email(field)
-
-        assert user_service.get_user_by_username.calls == [
-            pretend.call("username_or_email")
-        ]
-
-    def test_validate_username_or_email_with_none(self):
-        user_service = pretend.stub(
-            get_user_by_username=pretend.call_recorder(lambda userid: None),
-            get_user_by_email=pretend.call_recorder(lambda userid: None),
-        )
-        form = forms.RequestPasswordResetForm(user_service=user_service)
-        field = pretend.stub(data="username_or_email")
+    @pytest.mark.parametrize("form_input", ["_username", "foo@bar@net", "foo@"])
+    def test_validate_with_invalid_inputs(self, form_input):
+        form = forms.RequestPasswordResetForm()
+        field = pretend.stub(data=form_input)
 
         with pytest.raises(wtforms.validators.ValidationError):
             form.validate_username_or_email(field)
-
-        assert user_service.get_user_by_username.calls == [
-            pretend.call("username_or_email")
-        ]
-
-        assert user_service.get_user_by_email.calls == [
-            pretend.call("username_or_email")
-        ]
 
 
 class TestResetPasswordForm:

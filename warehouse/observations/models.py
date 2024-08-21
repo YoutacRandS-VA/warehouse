@@ -18,10 +18,11 @@ import typing
 
 from uuid import UUID
 
-from sqlalchemy import ForeignKey
+from sqlalchemy import ForeignKey, String, sql
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.ext.associationproxy import AssociationProxy, association_proxy
 from sqlalchemy.ext.declarative import AbstractConcreteBase
+from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import Mapped, declared_attr, mapped_column, relationship
 
 from warehouse import db
@@ -62,7 +63,7 @@ class Observer(db.Model):
     parent: AssociationProxy = association_proxy("_association", "parent")
 
 
-class HasObserversMixin:
+class HasObservers:
     """A mixin for models that can have observers."""
 
     @declared_attr
@@ -97,25 +98,29 @@ class HasObserversMixin:
         )
         return relationship(assoc_cls)
 
-    @declared_attr
-    def observations(cls):  # noqa: N805
-        """Simplify `foo.observer.observations` to `foo.observations`."""
-        return association_proxy(
-            "observer_association",
-            "observer.observations",
-        )
-
 
 class ObservationKind(enum.Enum):
     """
     The kinds of observations we can make. Format:
 
     key_used_in_python = ("key_used_in_postgres", "Human Readable Name")
+
+    Explicitly not a ForeignKey to a table, since we want to be able to add new
+    kinds of observations without having to update the database schema.
     """
 
-    IsMalicious = ("is_malicious", "Is Malicious")
+    IsDependencyConfusion = ("is_dependency_confusion", "Is Dependency Confusion")
+    IsMalware = ("is_malware", "Is Malware")
     IsSpam = ("is_spam", "Is Spam")
     SomethingElse = ("something_else", "Something Else")
+    AccountRecovery = (
+        "account_recovery",
+        "Account Recovery",
+    )
+
+
+# A reverse-lookup map by the string value stored in the database
+OBSERVATION_KIND_MAP = {kind.value[0]: kind for kind in ObservationKind}
 
 
 class Observation(AbstractConcreteBase, db.Model):
@@ -142,6 +147,16 @@ class Observation(AbstractConcreteBase, db.Model):
     summary: Mapped[str] = mapped_column(comment="A short summary of the observation")
     payload: Mapped[dict] = mapped_column(
         JSONB, comment="The observation payload we received"
+    )
+    additional: Mapped[dict] = mapped_column(
+        MutableDict.as_mutable(JSONB()),
+        comment="Additional data for the observation",
+        server_default=sql.text("'{}'"),
+    )
+    actions: Mapped[dict] = mapped_column(
+        MutableDict.as_mutable(JSONB()),
+        comment="Actions taken based on the observation",
+        server_default=sql.text("'{}'"),
     )
 
     def __repr__(self):
@@ -186,10 +201,15 @@ class HasObservations:
                     PG_UUID,
                     ForeignKey(f"{cls.__tablename__}.id"),
                     comment="The ID of the related model",
-                    nullable=False,
+                    nullable=True,
                     index=True,
                 ),
                 related=relationship(cls, back_populates="observations"),
+                related_name=mapped_column(
+                    String,
+                    comment="The name of the related model",
+                    nullable=False,
+                ),
                 observer_id=mapped_column(
                     PG_UUID,
                     ForeignKey("observers.id"),
@@ -221,6 +241,7 @@ class HasObservations:
             observer=actor.observer,
             payload=payload,
             related=self,
+            related_name=repr(self),
             summary=summary,
         )
 

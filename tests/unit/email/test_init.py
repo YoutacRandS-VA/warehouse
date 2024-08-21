@@ -156,7 +156,12 @@ class TestSendEmailToUser:
         assert task.delay.calls == [
             pretend.call(
                 expected,
-                {"subject": "My Subject", "body_text": "My Body", "body_html": None},
+                {
+                    "sender": None,
+                    "subject": "My Subject",
+                    "body_text": "My Body",
+                    "body_html": None,
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": user.id,
@@ -197,7 +202,7 @@ class TestSendEmailToUser:
         assert request.task.calls == []
         assert task.delay.calls == []
 
-    def test_doesnt_send_within_reset_window(self, pyramid_request, pyramid_services):
+    def test_doesnt_send_within_repeat_window(self, pyramid_request, pyramid_services):
         email_service = pretend.stub(
             last_sent=pretend.call_recorder(
                 lambda to, subject: datetime.datetime.now()
@@ -220,6 +225,49 @@ class TestSendEmailToUser:
 
         assert pyramid_request.task.calls == []
         assert task.delay.calls == []
+
+    def test_sends_when_outside_repeat_window(self, db_request, pyramid_services):
+        email_service = pretend.stub(
+            last_sent=pretend.call_recorder(
+                lambda to, subject: datetime.datetime.now()
+                - datetime.timedelta(seconds=69)
+            )
+        )
+        pyramid_services.register_service(email_service, IEmailSender, None, name="")
+
+        task = pretend.stub(delay=pretend.call_recorder(lambda *a, **kw: None))
+        db_request.task = pretend.call_recorder(lambda x: task)
+
+        user = UserFactory.create(with_verified_primary_email=True)
+
+        msg = EmailMessage(subject="My Subject", body_text="My Body")
+
+        email._send_email_to_user(
+            db_request, user, msg, repeat_window=datetime.timedelta(seconds=42)
+        )
+
+        assert db_request.task.calls == [pretend.call(email.send_email)]
+        assert task.delay.calls == [
+            pretend.call(
+                f"{user.name} <{user.primary_email.email}>",
+                {
+                    "sender": None,
+                    "subject": "My Subject",
+                    "body_text": "My Body",
+                    "body_html": None,
+                },
+                {
+                    "tag": "account:email:sent",
+                    "user_id": user.id,
+                    "additional": {
+                        "from_": None,
+                        "to": user.email,
+                        "subject": "My Subject",
+                        "redact_ip": False,
+                    },
+                },
+            )
+        ]
 
     @pytest.mark.parametrize(
         ("username", "primary_email", "address", "expected"),
@@ -270,7 +318,12 @@ class TestSendEmailToUser:
         assert task.delay.calls == [
             pretend.call(
                 expected,
-                {"subject": "My Subject", "body_text": "My Body", "body_html": None},
+                {
+                    "sender": None,
+                    "subject": "My Subject",
+                    "body_text": "My Body",
+                    "body_html": None,
+                },
                 {
                     "tag": "account:email:sent",
                     "user_id": user.id,
@@ -562,6 +615,7 @@ class TestSendAdminNewOrganizationRequestedEmail:
             pretend.call(
                 f"{admin_user.name} <{admin_user.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -666,6 +720,7 @@ class TestSendAdminNewOrganizationApprovedEmail:
             pretend.call(
                 f"{admin_user.name} <{admin_user.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -770,6 +825,7 @@ class TestSendAdminNewOrganizationDeclinedEmail:
             pretend.call(
                 f"{admin_user.name} <{admin_user.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -885,6 +941,7 @@ class TestSendPasswordResetEmail:
                 + (stub_user.email if email_addr is None else email_addr)
                 + ">",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -897,9 +954,9 @@ class TestSendPasswordResetEmail:
                     "user_id": stub_user.id,
                     "additional": {
                         "from_": "noreply@example.com",
-                        "to": "other@example.com"
-                        if stub_email
-                        else "email@example.com",
+                        "to": (
+                            "other@example.com" if stub_email else "email@example.com"
+                        ),
                         "subject": "Email Subject",
                         "redact_ip": False,
                     },
@@ -978,6 +1035,7 @@ class TestEmailVerificationEmail:
             pretend.call(
                 stub_email.email,
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -1103,6 +1161,7 @@ class TestPasswordChangeEmail:
             pretend.call(
                 f"{stub_user.username} <{stub_user.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -1220,6 +1279,7 @@ class TestPasswordCompromisedHIBPEmail:
             pretend.call(
                 f"{stub_user.username} <{stub_user.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -1293,6 +1353,7 @@ class TestTokenLeakEmail:
             pretend.call(
                 f"{stub_user.username} <{stub_user.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -1306,6 +1367,89 @@ class TestTokenLeakEmail:
                     "additional": {
                         "from_": None,
                         "to": "email@example.com",
+                        "subject": "Email Subject",
+                        "redact_ip": False,
+                    },
+                },
+            )
+        ]
+
+
+class TestAccountRecoveryInitiatedEmail:
+    @pytest.mark.parametrize("verified", [True, False])
+    def test_send_account_recovery_initiated_email(
+        self, pyramid_request, pyramid_config, monkeypatch, verified
+    ):
+        stub_user = pretend.stub(
+            id="id",
+            username="username",
+            name="",
+            email="email@example.com",
+            primary_email=pretend.stub(email="email@example.com", verified=verified),
+        )
+        stub_email = pretend.stub(id="id", email="email@example.com", verified=False)
+        subject_renderer = pyramid_config.testing_add_renderer(
+            "email/account-recovery-initiated/subject.txt"
+        )
+        subject_renderer.string_response = "Email Subject"
+        body_renderer = pyramid_config.testing_add_renderer(
+            "email/account-recovery-initiated/body.txt"
+        )
+        body_renderer.string_response = "Email Body"
+        html_renderer = pyramid_config.testing_add_renderer(
+            "email/account-recovery-initiated/body.html"
+        )
+        html_renderer.string_response = "Email HTML Body"
+
+        send_email = pretend.stub(
+            delay=pretend.call_recorder(lambda *args, **kwargs: None)
+        )
+        pyramid_request.task = pretend.call_recorder(lambda *args, **kwargs: send_email)
+        monkeypatch.setattr(email, "send_email", send_email)
+
+        pyramid_request.db = pretend.stub(
+            query=lambda a: pretend.stub(
+                filter=lambda *a: pretend.stub(
+                    one=lambda: pretend.stub(user_id=stub_user.id)
+                )
+            ),
+        )
+        pyramid_request.user = stub_user
+        pyramid_request.registry.settings = {"mail.sender": "noreply@example.com"}
+
+        result = email.send_account_recovery_initiated_email(
+            pyramid_request,
+            (stub_user, stub_email),
+            project_name="project",
+            support_issue_link="https://github.com/pypi/support/issues/666",
+            token="deadbeef",
+        )
+
+        assert result == {
+            "project_name": "project",
+            "support_issue_link": "https://github.com/pypi/support/issues/666",
+            "token": "deadbeef",
+            "user": stub_user,
+        }
+        assert pyramid_request.task.calls == [pretend.call(send_email)]
+        assert send_email.delay.calls == [
+            pretend.call(
+                f"{stub_user.username} <{stub_user.email}>",
+                {
+                    "sender": "support@pypi.org",
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
+                {
+                    "tag": "account:email:sent",
+                    "user_id": stub_user.id,
+                    "additional": {
+                        "from_": "support@pypi.org",
+                        "to": stub_user.email,
                         "subject": "Email Subject",
                         "redact_ip": False,
                     },
@@ -1363,6 +1507,7 @@ class TestPasswordCompromisedEmail:
             pretend.call(
                 f"{stub_user.username} <{stub_user.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -1384,10 +1529,10 @@ class TestPasswordCompromisedEmail:
         ]
 
 
-class TestBasicAuthWith2FAEmail:
+class TestPasswordResetByAdminEmail:
     @pytest.mark.parametrize("verified", [True, False])
-    def test_basic_auth_with_2fa_email(
-        self, pyramid_request, pyramid_config, monkeypatch, verified, metrics
+    def test_password_reset_by_admin_email(
+        self, pyramid_request, pyramid_config, monkeypatch, verified
     ):
         stub_user = pretend.stub(
             id="id",
@@ -1397,168 +1542,15 @@ class TestBasicAuthWith2FAEmail:
             primary_email=pretend.stub(email="email@example.com", verified=verified),
         )
         subject_renderer = pyramid_config.testing_add_renderer(
-            "email/basic-auth-with-2fa/subject.txt"
+            "email/password-reset-by-admin/subject.txt"
         )
         subject_renderer.string_response = "Email Subject"
         body_renderer = pyramid_config.testing_add_renderer(
-            "email/basic-auth-with-2fa/body.txt"
+            "email/password-reset-by-admin/body.txt"
         )
         body_renderer.string_response = "Email Body"
         html_renderer = pyramid_config.testing_add_renderer(
-            "email/basic-auth-with-2fa/body.html"
-        )
-        html_renderer.string_response = "Email HTML Body"
-
-        send_email = pretend.stub(
-            delay=pretend.call_recorder(lambda *args, **kwargs: None)
-        )
-        pyramid_request.task = pretend.call_recorder(lambda *args, **kwargs: send_email)
-        monkeypatch.setattr(email, "send_email", send_email)
-
-        pyramid_request.db = pretend.stub(
-            query=lambda a: pretend.stub(
-                filter=lambda *a: pretend.stub(
-                    one=lambda: pretend.stub(user_id=stub_user.id)
-                )
-            ),
-        )
-        pyramid_request.user = stub_user
-        pyramid_request.registry.settings = {"mail.sender": "noreply@example.com"}
-        project_name = "exampleproject"
-        result = email.send_basic_auth_with_two_factor_email(
-            pyramid_request, stub_user, project_name=project_name
-        )
-
-        assert result == {"project_name": project_name}
-        assert pyramid_request.task.calls == [pretend.call(send_email)]
-        assert send_email.delay.calls == [
-            pretend.call(
-                f"{stub_user.username} <{stub_user.email}>",
-                {
-                    "subject": "Email Subject",
-                    "body_text": "Email Body",
-                    "body_html": (
-                        "<html>\n<head></head>\n"
-                        "<body><p>Email HTML Body</p></body>\n</html>\n"
-                    ),
-                },
-                {
-                    "tag": "account:email:sent",
-                    "user_id": stub_user.id,
-                    "additional": {
-                        "from_": "noreply@example.com",
-                        "to": stub_user.email,
-                        "subject": "Email Subject",
-                        "redact_ip": False,
-                    },
-                },
-            )
-        ]
-        assert metrics.increment.calls == [
-            pretend.call(
-                "warehouse.emails.scheduled",
-                tags=[
-                    "template_name:basic-auth-with-2fa",
-                    "allow_unverified:True",
-                    "repeat_window:86400.0",
-                ],
-            )
-        ]
-
-
-class TestGPGSignatureUploadedEmail:
-    def test_gpg_signature_uploaded_email(
-        self, pyramid_request, pyramid_config, monkeypatch
-    ):
-        stub_user = pretend.stub(
-            id="id",
-            username="username",
-            name="",
-            email="email@example.com",
-            primary_email=pretend.stub(email="email@example.com", verified=True),
-        )
-        subject_renderer = pyramid_config.testing_add_renderer(
-            "email/gpg-signature-uploaded/subject.txt"
-        )
-        subject_renderer.string_response = "Email Subject"
-        body_renderer = pyramid_config.testing_add_renderer(
-            "email/gpg-signature-uploaded/body.txt"
-        )
-        body_renderer.string_response = "Email Body"
-        html_renderer = pyramid_config.testing_add_renderer(
-            "email/gpg-signature-uploaded/body.html"
-        )
-        html_renderer.string_response = "Email HTML Body"
-
-        send_email = pretend.stub(
-            delay=pretend.call_recorder(lambda *args, **kwargs: None)
-        )
-        pyramid_request.task = pretend.call_recorder(lambda *args, **kwargs: send_email)
-        monkeypatch.setattr(email, "send_email", send_email)
-
-        pyramid_request.db = pretend.stub(
-            query=lambda a: pretend.stub(
-                filter=lambda *a: pretend.stub(
-                    one=lambda: pretend.stub(user_id=stub_user.id)
-                )
-            ),
-        )
-        pyramid_request.user = stub_user
-        pyramid_request.registry.settings = {"mail.sender": "noreply@example.com"}
-        project_name = "exampleproject"
-        result = email.send_gpg_signature_uploaded_email(
-            pyramid_request, stub_user, project_name=project_name
-        )
-
-        assert result == {"project_name": project_name}
-        assert pyramid_request.task.calls == [pretend.call(send_email)]
-        assert send_email.delay.calls == [
-            pretend.call(
-                f"{stub_user.username} <{stub_user.email}>",
-                {
-                    "subject": "Email Subject",
-                    "body_text": "Email Body",
-                    "body_html": (
-                        "<html>\n<head></head>\n"
-                        "<body><p>Email HTML Body</p></body>\n</html>\n"
-                    ),
-                },
-                {
-                    "tag": "account:email:sent",
-                    "user_id": stub_user.id,
-                    "additional": {
-                        "from_": "noreply@example.com",
-                        "to": stub_user.email,
-                        "subject": "Email Subject",
-                        "redact_ip": False,
-                    },
-                },
-            )
-        ]
-
-
-class Test2FAonUploadEmail:
-    def test_send_two_factor_not_yet_enabled_email(
-        self, pyramid_request, pyramid_config, monkeypatch
-    ):
-        stub_user = pretend.stub(
-            id="id",
-            username="username",
-            name="",
-            email="email@example.com",
-            primary_email=pretend.stub(email="email@example.com", verified=True),
-            has_2fa=False,
-        )
-        subject_renderer = pyramid_config.testing_add_renderer(
-            "email/two-factor-not-yet-enabled/subject.txt"
-        )
-        subject_renderer.string_response = "Email Subject"
-        body_renderer = pyramid_config.testing_add_renderer(
-            "email/two-factor-not-yet-enabled/body.txt"
-        )
-        body_renderer.string_response = "Email Body"
-        html_renderer = pyramid_config.testing_add_renderer(
-            "email/two-factor-not-yet-enabled/body.html"
+            "email/password-reset-by-admin/body.html"
         )
         html_renderer.string_response = "Email HTML Body"
 
@@ -1578,17 +1570,15 @@ class Test2FAonUploadEmail:
         pyramid_request.user = stub_user
         pyramid_request.registry.settings = {"mail.sender": "noreply@example.com"}
 
-        result = email.send_two_factor_not_yet_enabled_email(
-            pyramid_request,
-            stub_user,
-        )
+        result = email.send_password_reset_by_admin_email(pyramid_request, stub_user)
 
-        assert result == {"username": stub_user.username}
+        assert result == {}
         assert pyramid_request.task.calls == [pretend.call(send_email)]
         assert send_email.delay.calls == [
             pretend.call(
                 f"{stub_user.username} <{stub_user.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -1661,6 +1651,7 @@ class TestAccountDeletionEmail:
             pretend.call(
                 f"{stub_user.username} <{stub_user.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -1795,6 +1786,7 @@ class TestPrimaryEmailChangeEmail:
             pretend.call(
                 "username <old_email@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -1924,6 +1916,7 @@ class TestSendNewOrganizationRequestedEmail:
             pretend.call(
                 f"{initiator_user.username} <{initiator_user.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -2016,6 +2009,7 @@ class TestSendNewOrganizationApprovedEmail:
             pretend.call(
                 f"{initiator_user.username} <{initiator_user.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -2107,6 +2101,7 @@ class TestSendNewOrganizationDeclinedEmail:
             pretend.call(
                 f"{initiator_user.username} <{initiator_user.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -2177,6 +2172,7 @@ class TestOrganizationProjectEmails:
             pretend.call(
                 f"{self.user.name} <{self.user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -2250,6 +2246,7 @@ class TestOrganizationMemberEmails:
             pretend.call(
                 f"{self.initiator_user.name} <{self.initiator_user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -2309,6 +2306,7 @@ class TestOrganizationMemberEmails:
             pretend.call(
                 f"{self.user.name} <{self.user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -2361,6 +2359,7 @@ class TestOrganizationMemberEmails:
             pretend.call(
                 f"{self.initiator_user.name} <{self.initiator_user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -2412,6 +2411,7 @@ class TestOrganizationMemberEmails:
             pretend.call(
                 f"{self.user.name} <{self.user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -2466,6 +2466,7 @@ class TestOrganizationMemberEmails:
             pretend.call(
                 f"{self.initiator_user.name} <{self.initiator_user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -2517,6 +2518,7 @@ class TestOrganizationMemberEmails:
             pretend.call(
                 f"{self.user.name} <{self.user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -2573,6 +2575,7 @@ class TestOrganizationMemberEmails:
             pretend.call(
                 f"{self.initiator_user.name} <{self.initiator_user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -2628,6 +2631,7 @@ class TestOrganizationMemberEmails:
             pretend.call(
                 f"{self.user.name} <{self.user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -2682,6 +2686,7 @@ class TestOrganizationMemberEmails:
             pretend.call(
                 f"{self.initiator_user.name} <{self.initiator_user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -2735,6 +2740,7 @@ class TestOrganizationMemberEmails:
             pretend.call(
                 f"{self.user.name} <{self.user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -2791,6 +2797,7 @@ class TestOrganizationMemberEmails:
             pretend.call(
                 f"{self.initiator_user.name} <{self.initiator_user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -2846,6 +2853,7 @@ class TestOrganizationMemberEmails:
             pretend.call(
                 f"{self.user.name} <{self.user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -2930,6 +2938,7 @@ class TestOrganizationUpdateEmails:
             pretend.call(
                 f"{self.user.name} <{self.user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -2991,6 +3000,7 @@ class TestOrganizationRenameEmails:
             pretend.call(
                 f"{self.user.name} <{self.user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -3043,6 +3053,7 @@ class TestOrganizationRenameEmails:
             pretend.call(
                 f"{self.user.name} <{self.user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -3101,6 +3112,7 @@ class TestOrganizationDeleteEmails:
             pretend.call(
                 f"{self.user.name} <{self.user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -3151,6 +3163,7 @@ class TestOrganizationDeleteEmails:
             pretend.call(
                 f"{self.user.name} <{self.user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -3239,6 +3252,7 @@ class TestTeamMemberEmails:
             pretend.call(
                 f"{recipient.name} <{recipient.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -3308,6 +3322,7 @@ class TestTeamEmails:
             pretend.call(
                 f"{self.user.name} <{self.user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -3414,6 +3429,7 @@ class TestCollaboratorAddedEmail:
             pretend.call(
                 "username <email@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -3435,6 +3451,7 @@ class TestCollaboratorAddedEmail:
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -3533,6 +3550,7 @@ class TestCollaboratorAddedEmail:
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -3614,6 +3632,7 @@ class TestProjectRoleVerificationEmail:
             pretend.call(
                 f"{stub_user.name} <{stub_user.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -3704,6 +3723,7 @@ class TestAddedAsCollaboratorEmail:
             pretend.call(
                 "username <email@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -3847,8 +3867,9 @@ class TestCollaboratorRemovedEmail:
         ]
         assert send_email.delay.calls == [
             pretend.call(
-                f"{ removed_user.name } <{ removed_user.primary_email.email }>",
+                f"{removed_user.name} <{removed_user.primary_email.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -3868,8 +3889,9 @@ class TestCollaboratorRemovedEmail:
                 },
             ),
             pretend.call(
-                f"{ submitter_user.name } <{ submitter_user.primary_email.email }>",
+                f"{submitter_user.name} <{submitter_user.primary_email.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -3942,8 +3964,9 @@ class TestRemovedAsCollaboratorEmail:
         assert db_request.task.calls == [pretend.call(send_email)]
         assert send_email.delay.calls == [
             pretend.call(
-                f"{ removed_user.name } <{ removed_user.primary_email.email }>",
+                f"{removed_user.name} <{removed_user.primary_email.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -4025,8 +4048,9 @@ class TestRoleChangedEmail:
         ]
         assert send_email.delay.calls == [
             pretend.call(
-                f"{ changed_user.name } <{ changed_user.primary_email.email }>",
+                f"{changed_user.name} <{changed_user.primary_email.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -4046,8 +4070,9 @@ class TestRoleChangedEmail:
                 },
             ),
             pretend.call(
-                f"{ submitter_user.name } <{ submitter_user.primary_email.email }>",
+                f"{submitter_user.name} <{submitter_user.primary_email.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -4124,8 +4149,9 @@ class TestRoleChangedAsCollaboratorEmail:
         assert db_request.task.calls == [pretend.call(send_email)]
         assert send_email.delay.calls == [
             pretend.call(
-                f"{ changed_user.name } <{ changed_user.primary_email.email }>",
+                f"{changed_user.name} <{changed_user.primary_email.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -4229,6 +4255,7 @@ class TestTeamCollaboratorEmails:
             pretend.call(
                 f"{self.user.name} <{self.user.email}>",
                 {
+                    "sender": None,
                     "subject": subject_renderer.string_response,
                     "body_text": body_renderer.string_response,
                     "body_html": (
@@ -4333,6 +4360,7 @@ class TestRemovedProjectEmail:
             pretend.call(
                 "username <email@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -4354,6 +4382,7 @@ class TestRemovedProjectEmail:
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -4454,6 +4483,7 @@ class TestRemovedProjectEmail:
             pretend.call(
                 "username <email@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -4475,6 +4505,7 @@ class TestRemovedProjectEmail:
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -4591,6 +4622,7 @@ class TestYankedReleaseEmail:
             pretend.call(
                 "username <email@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -4612,6 +4644,7 @@ class TestYankedReleaseEmail:
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -4726,6 +4759,7 @@ class TestYankedReleaseEmail:
             pretend.call(
                 "username <email@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -4747,6 +4781,7 @@ class TestYankedReleaseEmail:
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -4862,6 +4897,7 @@ class TestUnyankedReleaseEmail:
             pretend.call(
                 "username <email@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -4883,6 +4919,7 @@ class TestUnyankedReleaseEmail:
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -4996,6 +5033,7 @@ class TestUnyankedReleaseEmail:
             pretend.call(
                 "username <email@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -5017,6 +5055,7 @@ class TestUnyankedReleaseEmail:
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -5132,6 +5171,7 @@ class TestRemovedReleaseEmail:
             pretend.call(
                 "username <email@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -5153,6 +5193,7 @@ class TestRemovedReleaseEmail:
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -5266,6 +5307,7 @@ class TestRemovedReleaseEmail:
             pretend.call(
                 "username <email@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -5287,6 +5329,7 @@ class TestRemovedReleaseEmail:
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -5403,6 +5446,7 @@ class TestRemovedReleaseFileEmail:
             pretend.call(
                 "username <email@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -5424,6 +5468,7 @@ class TestRemovedReleaseFileEmail:
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -5538,6 +5583,7 @@ class TestRemovedReleaseFileEmail:
             pretend.call(
                 "username <email@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -5559,6 +5605,7 @@ class TestRemovedReleaseFileEmail:
             pretend.call(
                 "submitterusername <submiteremail@example.com>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -5647,6 +5694,7 @@ class TestTwoFactorEmail:
             pretend.call(
                 f"{stub_user.username} <{stub_user.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -5688,15 +5736,15 @@ class TestRecoveryCodeEmails:
             primary_email=pretend.stub(email="email@example.com", verified=True),
         )
         subject_renderer = pyramid_config.testing_add_renderer(
-            f"email/{ template_name }/subject.txt"
+            f"email/{template_name}/subject.txt"
         )
         subject_renderer.string_response = "Email Subject"
         body_renderer = pyramid_config.testing_add_renderer(
-            f"email/{ template_name }/body.txt"
+            f"email/{template_name}/body.txt"
         )
         body_renderer.string_response = "Email Body"
         html_renderer = pyramid_config.testing_add_renderer(
-            f"email/{ template_name }/body.html"
+            f"email/{template_name}/body.html"
         )
         html_renderer.string_response = "Email HTML Body"
 
@@ -5727,6 +5775,7 @@ class TestRecoveryCodeEmails:
             pretend.call(
                 f"{stub_user.username} <{stub_user.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -5769,15 +5818,15 @@ class TestTrustedPublisherEmails:
             primary_email=pretend.stub(email="email@example.com", verified=True),
         )
         subject_renderer = pyramid_config.testing_add_renderer(
-            f"email/{ template_name }/subject.txt"
+            f"email/{template_name}/subject.txt"
         )
         subject_renderer.string_response = "Email Subject"
         body_renderer = pyramid_config.testing_add_renderer(
-            f"email/{ template_name }/body.txt"
+            f"email/{template_name}/body.txt"
         )
         body_renderer.string_response = "Email Body"
         html_renderer = pyramid_config.testing_add_renderer(
-            f"email/{ template_name }/body.html"
+            f"email/{template_name}/body.html"
         )
         html_renderer.string_response = "Email HTML Body"
 
@@ -5815,6 +5864,7 @@ class TestTrustedPublisherEmails:
             pretend.call(
                 f"{stub_user.username} <{stub_user.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -5853,15 +5903,15 @@ class TestTrustedPublisherEmails:
             primary_email=pretend.stub(email="email@example.com", verified=True),
         )
         subject_renderer = pyramid_config.testing_add_renderer(
-            f"email/{ template_name }/subject.txt"
+            f"email/{template_name}/subject.txt"
         )
         subject_renderer.string_response = "Email Subject"
         body_renderer = pyramid_config.testing_add_renderer(
-            f"email/{ template_name }/body.txt"
+            f"email/{template_name}/body.txt"
         )
         body_renderer.string_response = "Email Body"
         html_renderer = pyramid_config.testing_add_renderer(
-            f"email/{ template_name }/body.html"
+            f"email/{template_name}/body.html"
         )
         html_renderer.string_response = "Email HTML Body"
 
@@ -5913,6 +5963,7 @@ class TestTrustedPublisherEmails:
             pretend.call(
                 f"{stub_user.username} <{stub_user.email}>",
                 {
+                    "sender": None,
                     "subject": "Email Subject",
                     "body_text": "Email Body",
                     "body_html": (
@@ -5931,4 +5982,133 @@ class TestTrustedPublisherEmails:
                     },
                 },
             )
+        ]
+
+    def test_api_token_warning_with_trusted_publisher_emails(
+        self, pyramid_request, pyramid_config, monkeypatch
+    ):
+        template_name = "api-token-used-in-trusted-publisher-project"
+        # We set up two users to receive the email. The owner of the API token
+        # will be stub_user, their username should be the one mentioned in the
+        # email body.
+        stub_user = pretend.stub(
+            id="id",
+            username="username",
+            name="",
+            email="email@example.com",
+            primary_email=pretend.stub(email="email@example.com", verified=True),
+        )
+        stub_user_maintainer = pretend.stub(
+            id="id_maintainer",
+            username="username_maintainer",
+            name="",
+            email="email_maintainer@example.com",
+            primary_email=pretend.stub(
+                email="email_maintainer@example.com", verified=True
+            ),
+        )
+        subject_renderer = pyramid_config.testing_add_renderer(
+            f"email/{template_name}/subject.txt"
+        )
+        subject_renderer.string_response = "Email Subject"
+        body_renderer = pyramid_config.testing_add_renderer(
+            f"email/{template_name}/body.txt"
+        )
+        body_renderer.string_response = "Email Body"
+        html_renderer = pyramid_config.testing_add_renderer(
+            f"email/{template_name}/body.html"
+        )
+        html_renderer.string_response = "Email HTML Body"
+
+        send_email = pretend.stub(
+            delay=pretend.call_recorder(lambda *args, **kwargs: None)
+        )
+        pyramid_request.task = pretend.call_recorder(lambda *args, **kwargs: send_email)
+        monkeypatch.setattr(email, "send_email", send_email)
+
+        pyramid_request.db = pretend.stub(
+            query=lambda a: pretend.stub(
+                filter=lambda *a: pretend.stub(
+                    one=lambda: pretend.stub(user_id=stub_user.id)
+                )
+            ),
+        )
+        pyramid_request.user = stub_user
+        pyramid_request.registry.settings = {"mail.sender": "noreply@example.com"}
+
+        project_name = "test_project"
+        api_token_name = "old_api_token"
+        result = email.send_api_token_used_in_trusted_publisher_project_email(
+            pyramid_request,
+            [stub_user, stub_user_maintainer],
+            project_name=project_name,
+            token_owner_username=stub_user.username,
+            token_name=api_token_name,
+        )
+
+        assert result == {
+            "project_name": project_name,
+            "token_owner_username": stub_user.username,
+            "token_name": api_token_name,
+        }
+        subject_renderer.assert_()
+        body_renderer.assert_(
+            project_name=project_name,
+            token_owner_username=stub_user.username,
+            token_name=api_token_name,
+        )
+        html_renderer.assert_(
+            project_name=project_name,
+            token_owner_username=stub_user.username,
+            token_name=api_token_name,
+        )
+        assert pyramid_request.task.calls == [
+            pretend.call(send_email),
+            pretend.call(send_email),
+        ]
+        assert send_email.delay.calls == [
+            pretend.call(
+                f"{stub_user.username} <{stub_user.email}>",
+                {
+                    "sender": None,
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
+                {
+                    "tag": "account:email:sent",
+                    "user_id": stub_user.id,
+                    "additional": {
+                        "from_": "noreply@example.com",
+                        "to": stub_user.email,
+                        "subject": "Email Subject",
+                        "redact_ip": False,
+                    },
+                },
+            ),
+            pretend.call(
+                f"{stub_user_maintainer.username} <{stub_user_maintainer.email}>",
+                {
+                    "sender": None,
+                    "subject": "Email Subject",
+                    "body_text": "Email Body",
+                    "body_html": (
+                        "<html>\n<head></head>\n"
+                        "<body><p>Email HTML Body</p></body>\n</html>\n"
+                    ),
+                },
+                {
+                    "tag": "account:email:sent",
+                    "user_id": stub_user_maintainer.id,
+                    "additional": {
+                        "from_": "noreply@example.com",
+                        "to": stub_user_maintainer.email,
+                        "subject": "Email Subject",
+                        "redact_ip": False,
+                    },
+                },
+            ),
         ]

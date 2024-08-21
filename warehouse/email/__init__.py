@@ -89,6 +89,7 @@ def _send_email_to_user(
     email=None,
     allow_unverified=False,
     repeat_window=None,
+    override_from=None,
 ):
     # If we were not given a specific email object, then we'll default to using
     # the User's primary email address.
@@ -115,12 +116,17 @@ def _send_email_to_user(
             "subject": msg.subject,
             "body_text": msg.body_text,
             "body_html": msg.body_html,
+            "sender": override_from,
         },
         {
             "tag": EventTag.Account.EmailSent,
             "user_id": user.id,
             "additional": {
-                "from_": request.registry.settings.get("mail.sender"),
+                "from_": (
+                    request.registry.settings.get("mail.sender")
+                    if override_from is None
+                    else override_from
+                ),
                 "to": email.email,
                 "subject": msg.subject,
                 "redact_ip": _redact_ip(request, email.email),
@@ -134,6 +140,7 @@ def _email(
     *,
     allow_unverified=False,
     repeat_window=None,
+    override_from=None,
 ):
     """
     This decorator is used to turn an e function into an email sending function!
@@ -190,6 +197,7 @@ def _email(
                     email=email,
                     allow_unverified=allow_unverified,
                     repeat_window=repeat_window,
+                    override_from=override_from,
                 )
                 metrics = request.find_service(IMetricsService, context=None)
                 metrics.increment(
@@ -197,9 +205,11 @@ def _email(
                     tags=[
                         f"template_name:{name}",
                         f"allow_unverified:{allow_unverified}",
-                        f"repeat_window:{repeat_window.total_seconds()}"
-                        if repeat_window
-                        else "repeat_window:none",
+                        (
+                            f"repeat_window:{repeat_window.total_seconds()}"
+                            if repeat_window
+                            else "repeat_window:none"
+                        ),
                     ],
                 )
 
@@ -328,32 +338,31 @@ def send_password_compromised_email_hibp(request, user):
     return {}
 
 
+@_email("password-reset-by-admin", allow_unverified=True)
+def send_password_reset_by_admin_email(request, user):
+    return {}
+
+
 @_email("token-compromised-leak", allow_unverified=True)
 def send_token_compromised_email_leak(request, user, *, public_url, origin):
     return {"username": user.username, "public_url": public_url, "origin": origin}
 
 
 @_email(
-    "basic-auth-with-2fa",
+    "account-recovery-initiated",
     allow_unverified=True,
-    repeat_window=datetime.timedelta(days=1),
+    override_from="support@pypi.org",
 )
-def send_basic_auth_with_two_factor_email(request, user, *, project_name):
-    return {"project_name": project_name}
-
-
-@_email(
-    "two-factor-not-yet-enabled",
-    allow_unverified=True,
-    repeat_window=datetime.timedelta(days=14),
-)
-def send_two_factor_not_yet_enabled_email(request, user):
-    return {"username": user.username}
-
-
-@_email("gpg-signature-uploaded", repeat_window=datetime.timedelta(days=1))
-def send_gpg_signature_uploaded_email(request, user, *, project_name):
-    return {"project_name": project_name}
+def send_account_recovery_initiated_email(
+    request, user_and_email, *, project_name, support_issue_link, token
+):
+    user, email = user_and_email
+    return {
+        "user": user,
+        "support_issue_link": support_issue_link,
+        "project_name": project_name,
+        "token": token,
+    }
 
 
 @_email("account-deleted")
@@ -1040,6 +1049,17 @@ def send_trusted_publisher_removed_email(request, user, project_name, publisher)
 def send_pending_trusted_publisher_invalidated_email(request, user, project_name):
     return {
         "project_name": project_name,
+    }
+
+
+@_email("api-token-used-in-trusted-publisher-project")
+def send_api_token_used_in_trusted_publisher_project_email(
+    request, users, project_name, token_owner_username, token_name
+):
+    return {
+        "token_owner_username": token_owner_username,
+        "project_name": project_name,
+        "token_name": token_name,
     }
 
 

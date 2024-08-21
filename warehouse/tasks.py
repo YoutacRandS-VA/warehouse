@@ -34,9 +34,9 @@ from warehouse.metrics import IMetricsService
 
 # We need to trick Celery into supporting rediss:// URLs which is how redis-py
 # signals that you should use Redis with TLS.
-celery.app.backends.BACKEND_ALIASES[
-    "rediss"
-] = "warehouse.tasks:TLSRedisBackend"  # noqa
+celery.app.backends.BACKEND_ALIASES["rediss"] = (
+    "warehouse.tasks:TLSRedisBackend"  # noqa
+)
 
 
 # We need to register that the sqs:// url scheme uses a netloc
@@ -113,6 +113,15 @@ class WarehouseTask(celery.Task):
         # The API design of Celery makes this threadlocal pretty impossible to
         # avoid :(
         request = get_current_request()
+
+        # Add custom SQS MessageAttributes to payload for tracing. Ref:
+        # https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-message-metadata.html
+        kwargs["message_attributes"] = {
+            "task_name": {
+                "StringValue": self.name,
+                "DataType": "String",
+            },
+        }
 
         # If for whatever reason we were unable to get a request we'll just
         # skip this and call the original method to send this immediately.
@@ -226,6 +235,8 @@ def includeme(config):
         task_serializer="json",
         worker_disable_rate_limits=True,
         REDBEAT_REDIS_URL=s["celery.scheduler_url"],
+        # Silence deprecation warning on startup
+        broker_connection_retry_on_startup=False,
     )
     config.registry["celery.app"].Task = WarehouseTask
     config.registry["celery.app"].pyramid_config = config

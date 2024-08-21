@@ -28,6 +28,7 @@ extensions = [
     "sphinxcontrib.httpdomain",
     "myst_parser",
     "sphinxcontrib.mermaid",
+    "sphinx_copybutton",
 ]
 
 # Add any paths that contain templates here, relative to this directory.
@@ -66,6 +67,11 @@ linkcheck_ignore = [
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
 html_theme = "furo"
+
+html_static_path = ["_static"]
+html_css_files = [
+    "css/extra.css",
+]
 
 # Output file base name for HTML help builder.
 htmlhelp_basename = "Warehousedoc"

@@ -27,11 +27,14 @@ from warehouse.oidc.models._core import (
 
 
 def _check_sub(
-    ground_truth: str, signed_claim: str, all_signed_claims: SignedClaims
+    ground_truth: str,
+    signed_claim: str,
+    _all_signed_claims: SignedClaims,
+    **_kwargs,
 ) -> bool:
     # If we haven't set a subject for the publisher, we don't need to check
     # this claim.
-    if ground_truth is None:
+    if ground_truth == "":
         return True
 
     # Defensive: Google should never send us an empty or null subject, but
@@ -70,7 +73,7 @@ class GooglePublisherMixin:
 
     @staticmethod
     def __lookup_no_sub__(klass, signed_claims: SignedClaims) -> Query | None:
-        return Query(klass).filter_by(email=signed_claims["email"], sub=None)
+        return Query(klass).filter_by(email=signed_claims["email"], sub="")
 
     __lookup_strategies__ = [
         __lookup_all__,
@@ -81,8 +84,15 @@ class GooglePublisherMixin:
     def publisher_name(self):
         return "Google"
 
+    @property
+    def publisher_base_url(self):
+        return None
+
     def publisher_url(self, claims=None):
         return None
+
+    def stored_claims(self, claims=None):
+        return {}
 
     @property
     def email_verified(self):

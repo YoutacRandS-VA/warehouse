@@ -102,7 +102,7 @@ class TestSimpleIndex:
         _assert_has_cors_headers(db_request.response.headers)
 
         if renderer_override is not None:
-            db_request.override_renderer == renderer_override
+            assert db_request.override_renderer == renderer_override
 
     @pytest.mark.parametrize(
         "content_type,renderer_override",
@@ -121,7 +121,7 @@ class TestSimpleIndex:
         _assert_has_cors_headers(db_request.response.headers)
 
         if renderer_override is not None:
-            db_request.override_renderer == renderer_override
+            assert db_request.override_renderer == renderer_override
 
     @pytest.mark.parametrize(
         "content_type,renderer_override",
@@ -142,7 +142,7 @@ class TestSimpleIndex:
         _assert_has_cors_headers(db_request.response.headers)
 
         if renderer_override is not None:
-            db_request.override_renderer == renderer_override
+            assert db_request.override_renderer == renderer_override
 
     @pytest.mark.parametrize(
         "content_type,renderer_override",
@@ -168,7 +168,20 @@ class TestSimpleIndex:
         _assert_has_cors_headers(db_request.response.headers)
 
         if renderer_override is not None:
-            db_request.override_renderer == renderer_override
+            assert db_request.override_renderer == renderer_override
+
+    def test_quarantined_project_omitted_from_index(self, db_request):
+        db_request.accept = "text/html"
+        ProjectFactory.create(name="foo")
+        ProjectFactory.create(name="bar", lifecycle_status="quarantine-enter")
+
+        assert simple.simple_index(db_request) == {
+            "meta": {"_last-serial": 0, "api-version": API_VERSION},
+            "projects": [{"name": "foo", "_last-serial": 0}],
+        }
+        assert db_request.response.headers["X-PyPI-Last-Serial"] == "0"
+        assert db_request.response.content_type == "text/html"
+        _assert_has_cors_headers(db_request.response.headers)
 
 
 class TestSimpleDetail:
@@ -210,7 +223,7 @@ class TestSimpleDetail:
         _assert_has_cors_headers(db_request.response.headers)
 
         if renderer_override is not None:
-            db_request.override_renderer == renderer_override
+            assert db_request.override_renderer == renderer_override
 
     @pytest.mark.parametrize(
         "content_type,renderer_override",
@@ -235,7 +248,7 @@ class TestSimpleDetail:
         _assert_has_cors_headers(db_request.response.headers)
 
         if renderer_override is not None:
-            db_request.override_renderer == renderer_override
+            assert db_request.override_renderer == renderer_override
 
     @pytest.mark.parametrize(
         "content_type,renderer_override",
@@ -250,8 +263,8 @@ class TestSimpleDetail:
             FileFactory.create(release=r, filename=f"{project.name}-{r.version}.tar.gz")
             for r in releases
         ]
-        # let's assert the result is ordered by string comparison of filename
-        files = sorted(files, key=lambda key: key.filename)
+        # let's assert the result is ordered by string comparison of version, filename
+        files = sorted(files, key=lambda f: (parse(f.release.version), f.filename))
         urls_iter = (f"/file/{f.filename}" for f in files)
         db_request.matchdict["name"] = project.normalized_name
         db_request.route_url = lambda *a, **kw: next(urls_iter)
@@ -283,7 +296,7 @@ class TestSimpleDetail:
         _assert_has_cors_headers(db_request.response.headers)
 
         if renderer_override is not None:
-            db_request.override_renderer == renderer_override
+            assert db_request.override_renderer == renderer_override
 
     @pytest.mark.parametrize(
         "content_type,renderer_override",
@@ -331,7 +344,7 @@ class TestSimpleDetail:
         _assert_has_cors_headers(db_request.response.headers)
 
         if renderer_override is not None:
-            db_request.override_renderer == renderer_override
+            assert db_request.override_renderer == renderer_override
 
     @pytest.mark.parametrize(
         "content_type,renderer_override",
@@ -404,14 +417,16 @@ class TestSimpleDetail:
                     "yanked": False,
                     "size": f.size,
                     "upload-time": f.upload_time.isoformat() + "Z",
-                    "data-dist-info-metadata": {
-                        "sha256": "deadbeefdeadbeefdeadbeefdeadbeef"
-                    }
-                    if f.metadata_file_sha256_digest is not None
-                    else False,
-                    "core-metadata": {"sha256": "deadbeefdeadbeefdeadbeefdeadbeef"}
-                    if f.metadata_file_sha256_digest is not None
-                    else False,
+                    "data-dist-info-metadata": (
+                        {"sha256": "deadbeefdeadbeefdeadbeefdeadbeef"}
+                        if f.metadata_file_sha256_digest is not None
+                        else False
+                    ),
+                    "core-metadata": (
+                        {"sha256": "deadbeefdeadbeefdeadbeefdeadbeef"}
+                        if f.metadata_file_sha256_digest is not None
+                        else False
+                    ),
                 }
                 for f in files
             ],
@@ -422,4 +437,20 @@ class TestSimpleDetail:
         _assert_has_cors_headers(db_request.response.headers)
 
         if renderer_override is not None:
-            db_request.override_renderer == renderer_override
+            assert db_request.override_renderer == renderer_override
+
+    def test_with_files_quarantined_omitted_from_index(self, db_request):
+        db_request.accept = "text/html"
+        project = ProjectFactory.create(lifecycle_status="quarantine-enter")
+        releases = ReleaseFactory.create_batch(3, project=project)
+        _ = [
+            FileFactory.create(release=r, filename=f"{project.name}-{r.version}.tar.gz")
+            for r in releases
+        ]
+
+        assert simple.simple_detail(project, db_request) == {
+            "meta": {"_last-serial": 0, "api-version": API_VERSION},
+            "name": project.normalized_name,
+            "files": [],
+            "versions": [],
+        }

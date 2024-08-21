@@ -20,22 +20,33 @@ from uuid import UUID
 import packaging.utils
 
 from github_reserved_names import ALL as GITHUB_RESERVED_NAMES
-from pyramid.authorization import Allow
+from pyramid.authorization import Allow, Authenticated
 from pyramid.threadlocal import get_current_request
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
+    Column,
     FetchedValue,
     ForeignKey,
     Index,
+    Integer,
     String,
     Text,
     UniqueConstraint,
+    cast,
     func,
+    or_,
     orm,
+    select,
     sql,
 )
-from sqlalchemy.dialects.postgresql import CITEXT, UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import (
+    ARRAY,
+    CITEXT,
+    ENUM,
+    REGCLASS,
+    UUID as PG_UUID,
+)
 from sqlalchemy.exc import MultipleResultsFound, NoResultFound
 from sqlalchemy.ext.associationproxy import association_proxy
 from sqlalchemy.ext.hybrid import hybrid_property
@@ -51,6 +62,7 @@ from urllib3.util import parse_url
 
 from warehouse import db
 from warehouse.accounts.models import User
+from warehouse.authnz import Permissions
 from warehouse.classifiers.models import Classifier
 from warehouse.events.models import HasEvents
 from warehouse.integrations.vulnerabilities.models import VulnerabilityRecord
@@ -64,12 +76,14 @@ from warehouse.organizations.models import (
     TeamProjectRole,
 )
 from warehouse.sitemap.models import SitemapMixin
-from warehouse.utils import dotted_navigator
+from warehouse.utils import dotted_navigator, wheel
 from warehouse.utils.attrs import make_repr
 from warehouse.utils.db.types import bool_false, datetime_now
 
 if typing.TYPE_CHECKING:
     from warehouse.oidc.models import OIDCPublisher
+
+_MONOTONIC_SEQUENCE = 42
 
 
 class Role(db.Model):
@@ -121,7 +135,7 @@ class RoleInvitation(db.Model):
         index=True,
     )
 
-    user: Mapped[User] = orm.relationship(lazy=False)
+    user: Mapped[User] = orm.relationship(lazy=False, back_populates="role_invitations")
     project: Mapped[Project] = orm.relationship(lazy=False)
 
 
@@ -148,18 +162,12 @@ class ProjectFactory:
             return True
 
 
-class TwoFactorRequireable:
-    # Project owner requires 2FA for this project
-    owners_require_2fa: Mapped[bool_false]
-    # PyPI requires 2FA for this project
-    pypi_mandates_2fa: Mapped[bool_false]
-
-    @hybrid_property
-    def two_factor_required(self):
-        return self.owners_require_2fa | self.pypi_mandates_2fa
+class LifecycleStatus(enum.StrEnum):
+    QuarantineEnter = "quarantine-enter"
+    QuarantineExit = "quarantine-exit"
 
 
-class Project(SitemapMixin, TwoFactorRequireable, HasEvents, HasObservations, db.Model):
+class Project(SitemapMixin, HasEvents, HasObservations, db.Model):
     __tablename__ = "projects"
     __repr__ = make_repr("name")
 
@@ -179,6 +187,16 @@ class Project(SitemapMixin, TwoFactorRequireable, HasEvents, HasObservations, db
     last_serial: Mapped[int] = mapped_column(server_default=sql.text("0"))
     total_size: Mapped[int | None] = mapped_column(
         BigInteger, server_default=sql.text("0")
+    )
+    lifecycle_status: Mapped[LifecycleStatus | None] = mapped_column(
+        comment="Lifecycle status can change project visibility and access"
+    )
+    lifecycle_status_changed: Mapped[datetime_now | None] = mapped_column(
+        onupdate=func.now(),
+        comment="When the lifecycle status was last changed",
+    )
+    lifecycle_status_note: Mapped[str | None] = mapped_column(
+        comment="Note about the lifecycle status"
     )
 
     oidc_publishers: Mapped[list[OIDCPublisher]] = orm.relationship(
@@ -228,6 +246,7 @@ class Project(SitemapMixin, TwoFactorRequireable, HasEvents, HasObservations, db
             "project_name_ultranormalized",
             func.ultranormalize_name(name),
         ),
+        Index("projects_lifecycle_status_idx", "lifecycle_status"),
     )
 
     def __getitem__(self, version):
@@ -264,14 +283,47 @@ class Project(SitemapMixin, TwoFactorRequireable, HasEvents, HasObservations, db
     def __acl__(self):
         session = orm.object_session(self)
         acls = [
-            (Allow, "group:admins", "admin"),
-            (Allow, "group:moderators", "moderator"),
+            # TODO: Similar to `warehouse.accounts.models.User.__acl__`, we express the
+            #       permissions here in terms of the permissions that the user has on
+            #       the project. This is more complex, as add ACL Entries based on other
+            #       criteria, such as the user's role in the project.
+            (
+                Allow,
+                "group:admins",
+                (
+                    Permissions.AdminDashboardSidebarRead,
+                    Permissions.AdminObservationsRead,
+                    Permissions.AdminObservationsWrite,
+                    Permissions.AdminProhibitedProjectsWrite,
+                    Permissions.AdminProjectsDelete,
+                    Permissions.AdminProjectsRead,
+                    Permissions.AdminProjectsSetLimit,
+                    Permissions.AdminProjectsWrite,
+                    Permissions.AdminRoleAdd,
+                    Permissions.AdminRoleDelete,
+                ),
+            ),
+            (
+                Allow,
+                "group:moderators",
+                (
+                    Permissions.AdminDashboardSidebarRead,
+                    Permissions.AdminObservationsRead,
+                    Permissions.AdminObservationsWrite,
+                    Permissions.AdminProjectsRead,
+                    Permissions.AdminProjectsSetLimit,
+                    Permissions.AdminRoleAdd,
+                    Permissions.AdminRoleDelete,
+                ),
+            ),
+            (Allow, "group:observers", Permissions.APIObservationsAdd),
+            (Allow, Authenticated, Permissions.SubmitMalwareObservation),
         ]
 
         # The project has zero or more OIDC publishers registered to it,
         # each of which serves as an identity with the ability to upload releases.
         for publisher in self.oidc_publishers:
-            acls.append((Allow, f"oidc:{publisher.id}", ["upload"]))
+            acls.append((Allow, f"oidc:{publisher.id}", [Permissions.ProjectsUpload]))
 
         # Get all of the users for this project.
         query = session.query(Role).filter(Role.project == self)
@@ -303,10 +355,29 @@ class Project(SitemapMixin, TwoFactorRequireable, HasEvents, HasObservations, db
             permissions |= {(role.user_id, "Administer") for role in query.all()}
 
         for user_id, permission_name in sorted(permissions, key=lambda x: (x[1], x[0])):
-            if permission_name == "Administer":
-                acls.append((Allow, f"user:{user_id}", ["manage:project", "upload"]))
+            # Disallow Write permissions for Projects in quarantine, allow Upload
+            if self.lifecycle_status == LifecycleStatus.QuarantineEnter:
+                acls.append(
+                    (
+                        Allow,
+                        f"user:{user_id}",
+                        [Permissions.ProjectsRead, Permissions.ProjectsUpload],
+                    )
+                )
+            elif permission_name == "Administer":
+                acls.append(
+                    (
+                        Allow,
+                        f"user:{user_id}",
+                        [
+                            Permissions.ProjectsRead,
+                            Permissions.ProjectsUpload,
+                            Permissions.ProjectsWrite,
+                        ],
+                    )
+                )
             else:
-                acls.append((Allow, f"user:{user_id}", ["upload"]))
+                acls.append((Allow, f"user:{user_id}", [Permissions.ProjectsUpload]))
         return acls
 
     @property
@@ -343,7 +414,11 @@ class Project(SitemapMixin, TwoFactorRequireable, HasEvents, HasObservations, db
         return (
             orm.object_session(self)
             .query(
-                Release.version, Release.created, Release.is_prerelease, Release.yanked
+                Release.version,
+                Release.created,
+                Release.is_prerelease,
+                Release.yanked,
+                Release.yanked_reason,
             )
             .filter(Release.project == self)
             .order_by(Release._pypi_ordering.desc())
@@ -426,6 +501,33 @@ class ReleaseURL(db.Model):
 
     name: Mapped[str] = mapped_column(String(32))
     url: Mapped[str]
+    verified: Mapped[bool_false]
+
+
+DynamicFieldsEnum = ENUM(
+    "Platform",
+    "Supported-Platform",
+    "Summary",
+    "Description",
+    "Description-Content-Type",
+    "Keywords",
+    "Home-Page",
+    "Download-Url",
+    "Author",
+    "Author-Email",
+    "Maintainer",
+    "Maintainer-Email",
+    "License",
+    "Classifier",
+    "Requires-Dist",
+    "Requires-Python",
+    "Requires-External",
+    "Project-Url",
+    "Provides-Extra",
+    "Provides-Dist",
+    "Obsoletes-Dist",
+    name="release_dynamic_fields",
+)
 
 
 class Release(HasObservations, db.Model):
@@ -460,6 +562,13 @@ class Release(HasObservations, db.Model):
     license: Mapped[str | None]
     summary: Mapped[str | None]
     keywords: Mapped[str | None]
+    keywords_array: Mapped[list[str] | None] = mapped_column(
+        ARRAY(String),
+        comment=(
+            "Array of keywords. Null indicates no keywords were supplied by "
+            "the uploader."
+        ),
+    )
     platform: Mapped[str | None]
     download_url: Mapped[str | None]
     _pypi_ordering: Mapped[int | None]
@@ -480,6 +589,12 @@ class Release(HasObservations, db.Model):
 
     yanked_reason: Mapped[str] = mapped_column(server_default="")
 
+    dynamic = Column(  # type: ignore[var-annotated]
+        ARRAY(DynamicFieldsEnum),
+        nullable=True,
+        comment="Array of metadata fields marked as Dynamic (PEP 643/Metadata 2.2)",
+    )
+
     _classifiers: Mapped[list[Classifier]] = orm.relationship(
         secondary="release_classifiers",
         order_by=Classifier.ordering,
@@ -496,7 +611,7 @@ class Release(HasObservations, db.Model):
     project_urls = association_proxy(
         "_project_urls",
         "url",
-        creator=lambda k, v: ReleaseURL(name=k, url=v),
+        creator=lambda k, v: ReleaseURL(name=k, url=v["url"], verified=v["verified"]),
     )
 
     files: Mapped[list[File]] = orm.relationship(
@@ -532,6 +647,12 @@ class Release(HasObservations, db.Model):
     _provides_dist = _dependency_relation(DependencyKind.provides_dist)
     provides_dist = association_proxy("_provides_dist", "specifier")
 
+    provides_extra = Column(  # type: ignore[var-annotated]
+        ARRAY(Text),
+        nullable=True,
+        comment="Array of extra names (PEP 566/685|Metadata 2.1/2.3)",
+    )
+
     _obsoletes_dist = _dependency_relation(DependencyKind.obsoletes_dist)
     obsoletes_dist = association_proxy("_obsoletes_dist", "specifier")
 
@@ -566,6 +687,21 @@ class Release(HasObservations, db.Model):
 
             _urls[name] = url
 
+        return _urls
+
+    def urls_by_verify_status(self, verified: bool):
+        matching_urls = {
+            release_url.url
+            for release_url in self._project_urls.values()  # type: ignore[attr-defined]
+            if release_url.verified == verified
+        }
+
+        # Filter the output of `Release.urls`, since it has custom logic to de-duplicate
+        # release URLs
+        _urls = OrderedDict()
+        for name, url in self.urls.items():
+            if url in matching_urls:
+                _urls[name] = url
         return _urls
 
     @staticmethod
@@ -692,13 +828,24 @@ class File(HasEvents, db.Model):
     archived: Mapped[bool_false] = mapped_column(
         comment="If True, the object has been archived to our archival bucket.",
     )
+    metadata_file_unbackfillable: Mapped[bool_false] = mapped_column(
+        nullable=True,
+        comment="If True, the metadata for the file cannot be backfilled.",
+    )
 
     @property
     def uploaded_via_trusted_publisher(self) -> bool:
         """Return True if the file was uploaded via a trusted publisher."""
         return (
             self.events.where(
-                self.Event.additional.op("->>")("publisher_url").is_not(None)  # type: ignore[attr-defined] # noqa E501
+                or_(
+                    self.Event.additional[  # type: ignore[attr-defined]
+                        "uploaded_via_trusted_publisher"
+                    ].as_boolean(),
+                    self.Event.additional["publisher_url"]  # type: ignore[attr-defined]
+                    .as_string()
+                    .is_not(None),
+                )
             ).count()
             > 0
         )
@@ -714,6 +861,10 @@ class File(HasEvents, db.Model):
     @validates("requires_python")
     def validates_requires_python(self, *args, **kwargs):
         raise RuntimeError("Cannot set File.requires_python")
+
+    @property
+    def pretty_wheel_tags(self) -> list[str]:
+        return wheel.filename_to_pretty_tags(self.filename)
 
 
 class Filename(db.ModelBase):
@@ -768,6 +919,33 @@ class JournalEntry(db.ModelBase):
     submitted_by: Mapped[User] = orm.relationship(lazy="raise_on_sql")
 
 
+@db.listens_for(db.Session, "before_flush")
+def ensure_monotonic_journals(config, session, flush_context, instances):
+    # We rely on `journals.id` to be a monotonically increasing integer,
+    # however the way that SERIAL is implemented, it does not guarentee
+    # that is the case.
+    #
+    # Ultimately SERIAL fetches the next integer regardless of what happens
+    # inside of the transaction. So journals.id will get filled in, in order
+    # of when the `INSERT` statements were executed, but not in the order
+    # that transactions were committed.
+    #
+    # The way this works, not even the SERIALIZABLE transaction types give
+    # us this property. Instead we have to implement our own locking that
+    # ensures that each new journal entry will be serialized.
+    for obj in session.new:
+        if isinstance(obj, JournalEntry):
+            session.execute(
+                select(
+                    func.pg_advisory_xact_lock(
+                        cast(cast(JournalEntry.__tablename__, REGCLASS), Integer),
+                        _MONOTONIC_SEQUENCE,
+                    )
+                )
+            )
+            return
+
+
 class ProhibitedProjectName(db.Model):
     __tablename__ = "prohibited_project_names"
     __table_args__ = (
@@ -786,3 +964,30 @@ class ProhibitedProjectName(db.Model):
     )
     prohibited_by: Mapped[User] = orm.relationship()
     comment: Mapped[str] = mapped_column(server_default="")
+
+
+class ProjectMacaroonWarningAssociation(db.Model):
+    """
+    Association table for Projects and Macaroons where a row (P, M) exists in
+    the table iff all of the following statements are true:
+    - M is an API-token Macaroon
+    - M was used to upload a file to project P
+    - P had a Trusted Publisher configured at the time of the upload
+    - An email warning was sent to P's maintainers about the use of M
+
+    In other words, this table tracks if we have warned a project's
+    maintainers about a specific API token being used in spite of a Trusted
+    Publisher being present. This is used in order to only send the warning
+    once per project and API token.
+    """
+
+    __tablename__ = "project_macaroon_warning_association"
+
+    macaroon_id = mapped_column(
+        ForeignKey("macaroons.id", onupdate="CASCADE", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    project_id = mapped_column(
+        ForeignKey("projects.id", onupdate="CASCADE", ondelete="CASCADE"),
+        primary_key=True,
+    )

@@ -18,6 +18,7 @@ import pytest
 from pyramid.authorization import Authenticated
 
 from warehouse.accounts.models import Email, RecoveryCode, User, UserFactory, WebAuthn
+from warehouse.authnz import Permissions
 from warehouse.utils.security_policy import principals_for
 
 from ...common.db.accounts import (
@@ -164,26 +165,68 @@ class TestUser:
     def test_acl(self, db_session):
         user = DBUserFactory.create()
         assert user.__acl__() == [
-            ("Allow", "group:admins", "admin"),
-            ("Allow", "group:moderators", "moderator"),
+            (
+                "Allow",
+                "group:admins",
+                (
+                    Permissions.AdminUsersRead,
+                    Permissions.AdminUsersWrite,
+                    Permissions.AdminUsersEmailWrite,
+                    Permissions.AdminUsersAccountRecoveryWrite,
+                    Permissions.AdminDashboardSidebarRead,
+                ),
+            ),
+            (
+                "Allow",
+                "group:support",
+                (
+                    Permissions.AdminUsersRead,
+                    Permissions.AdminUsersEmailWrite,
+                    Permissions.AdminUsersAccountRecoveryWrite,
+                    Permissions.AdminDashboardSidebarRead,
+                ),
+            ),
+            (
+                "Allow",
+                "group:moderators",
+                (Permissions.AdminUsersRead, Permissions.AdminDashboardSidebarRead),
+            ),
         ]
 
     @pytest.mark.parametrize(
         (
             "is_superuser",
+            "is_support",
             "is_moderator",
             "is_psf_staff",
             "expected",
         ),
         [
-            (False, False, False, []),
+            (False, False, False, False, []),
             (
                 True,
                 False,
                 False,
-                ["group:admins", "group:moderators", "group:psf_staff"],
+                False,
+                [
+                    "group:admins",
+                    "group:moderators",
+                    "group:observers",
+                    "group:psf_staff",
+                ],
             ),
             (
+                False,
+                True,
+                False,
+                False,
+                [
+                    "group:support",
+                    "group:moderators",
+                ],
+            ),
+            (
+                False,
                 False,
                 True,
                 False,
@@ -191,17 +234,25 @@ class TestUser:
             ),
             (
                 True,
+                False,
                 True,
                 False,
-                ["group:admins", "group:moderators", "group:psf_staff"],
+                [
+                    "group:admins",
+                    "group:moderators",
+                    "group:observers",
+                    "group:psf_staff",
+                ],
             ),
             (
+                False,
                 False,
                 False,
                 True,
                 ["group:psf_staff"],
             ),
             (
+                False,
                 False,
                 True,
                 True,
@@ -212,6 +263,7 @@ class TestUser:
     def test_principals(
         self,
         is_superuser,
+        is_support,
         is_moderator,
         is_psf_staff,
         expected,
@@ -219,6 +271,7 @@ class TestUser:
         user = User(
             id=uuid.uuid4(),
             is_superuser=is_superuser,
+            is_support=is_support,
             is_moderator=is_moderator,
             is_psf_staff=is_psf_staff,
         )

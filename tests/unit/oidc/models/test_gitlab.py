@@ -34,10 +34,6 @@ from warehouse.oidc.models import _core, gitlab
             "gitlab.com/foo/bar//too//many//slashes.yml@/some/ref",
             "too//many//slashes.yml",
         ),
-        (
-            "gitlab.com/foo/bar//too//many//slashes.yml@/some/ref",
-            "too//many//slashes.yml",
-        ),
         ("gitlab.com/foo/bar//has-@.yml@/some/ref", "has-@.yml"),
         ("gitlab.com/foo/bar//foo.bar.yml@/some/ref", "foo.bar.yml"),
         ("gitlab.com/foo/bar//foo.yml.bar.yml@/some/ref", "foo.yml.bar.yml"),
@@ -199,16 +195,10 @@ class TestGitLabPublisher:
         }
 
     def test_gitlab_publisher_unaccounted_claims(self, monkeypatch):
-        publisher = gitlab.GitLabPublisher(
-            project="fakerepo",
-            namespace="fakeowner",
-            workflow_filepath="subfolder/fakeworkflow.yml",
-        )
-
         scope = pretend.stub()
         sentry_sdk = pretend.stub(
             capture_message=pretend.call_recorder(lambda s: None),
-            push_scope=pretend.call_recorder(
+            new_scope=pretend.call_recorder(
                 lambda: pretend.stub(
                     __enter__=lambda *a: scope, __exit__=lambda *a: None
                 )
@@ -223,11 +213,8 @@ class TestGitLabPublisher:
         }
         signed_claims["fake-claim"] = "fake"
         signed_claims["another-fake-claim"] = "also-fake"
-        with pytest.raises(errors.InvalidPublisherError) as e:
-            publisher.verify_claims(
-                signed_claims=signed_claims, publisher_service=pretend.stub()
-            )
-        assert str(e.value) == "Check failed for required claim 'sub'"
+
+        gitlab.GitLabPublisher.check_claims_existence(signed_claims)
         assert sentry_sdk.capture_message.calls == [
             pretend.call(
                 "JWT for GitLabPublisher has unaccounted claims: "
@@ -236,7 +223,11 @@ class TestGitLabPublisher:
         ]
         assert scope.fingerprint == ["another-fake-claim", "fake-claim"]
 
-    @pytest.mark.parametrize("missing", ["sub", "ref_path"])
+    @pytest.mark.parametrize(
+        "missing",
+        gitlab.GitLabPublisher.__required_verifiable_claims__.keys()
+        | gitlab.GitLabPublisher.__required_unverifiable_claims__,
+    )
     def test_gitlab_publisher_missing_claims(self, monkeypatch, missing):
         publisher = gitlab.GitLabPublisher(
             project="fakerepo",
@@ -247,7 +238,7 @@ class TestGitLabPublisher:
         scope = pretend.stub()
         sentry_sdk = pretend.stub(
             capture_message=pretend.call_recorder(lambda s: None),
-            push_scope=pretend.call_recorder(
+            new_scope=pretend.call_recorder(
                 lambda: pretend.stub(
                     __enter__=lambda *a: scope, __exit__=lambda *a: None
                 )
@@ -264,9 +255,7 @@ class TestGitLabPublisher:
         assert missing not in signed_claims
         assert publisher.__required_verifiable_claims__
         with pytest.raises(errors.InvalidPublisherError) as e:
-            publisher.verify_claims(
-                signed_claims=signed_claims, publisher_service=pretend.stub()
-            )
+            gitlab.GitLabPublisher.check_claims_existence(signed_claims)
         assert str(e.value) == f"Missing claim {missing!r}"
         assert sentry_sdk.capture_message.calls == [
             pretend.call(f"JWT for GitLabPublisher is missing claim: {missing}")
@@ -602,14 +591,15 @@ class TestGitLabPublisher:
         db_request.db.add(publisher1)
         db_request.db.commit()
 
+        publisher2 = gitlab.GitLabPublisher(
+            project="repository_name",
+            namespace="repository_owner",
+            workflow_filepath="subfolder/worflow_filename.yml",
+            environment="",
+        )
+        db_request.db.add(publisher2)
+
         with pytest.raises(sqlalchemy.exc.IntegrityError):
-            publisher2 = gitlab.GitLabPublisher(
-                project="repository_name",
-                namespace="repository_owner",
-                workflow_filepath="subfolder/worflow_filename.yml",
-                environment="",
-            )
-            db_request.db.add(publisher2)
             db_request.db.commit()
 
     @pytest.mark.parametrize(

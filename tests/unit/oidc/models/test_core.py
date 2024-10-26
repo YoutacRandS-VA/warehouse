@@ -51,8 +51,12 @@ class TestOIDCPublisher:
         publisher = _core.OIDCPublisher(projects=[])
 
         with pytest.raises(errors.InvalidPublisherError) as e:
-            publisher.verify_claims(signed_claims={}, publisher_service=pretend.stub())
+            publisher.check_claims_existence(signed_claims={})
         assert str(e.value) == "No required verifiable claims"
+
+    def test_supports_attestations(self):
+        publisher = _core.OIDCPublisher(projects=[])
+        assert not publisher.supports_attestations
 
     @pytest.mark.parametrize(
         ("url", "publisher_url", "expected"),
@@ -71,6 +75,12 @@ class TestOIDCPublisher:
                 "https://gitlab.com/owner/project",
                 "https://gitlab.com/owner/project",
                 True,
+            ),
+            (
+                # Google trivial case (no publisher URL)
+                "https://example.com/owner/project",
+                None,
+                False,
             ),
             (  # URL is a sub-path of the TP URL
                 "https://github.com/owner/project/issues",
@@ -129,12 +139,14 @@ class TestOIDCPublisher:
         ],
     )
     def test_verify_url(self, monkeypatch, url, publisher_url, expected):
-        class ConcretePublisher(_core.OIDCPublisher):
+        class TestPublisher(_core.OIDCPublisher):
+            __abstract__ = True
+
             @property
             def publisher_base_url(self):
                 return publisher_url
 
-        publisher = ConcretePublisher()
+        publisher = TestPublisher()
         assert publisher.verify_url(url) == expected
 
 

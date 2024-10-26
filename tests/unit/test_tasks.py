@@ -77,8 +77,11 @@ class TestWarehouseTask:
         assert runner.calls == [pretend.call(request)]
 
     def test_retry(self, monkeypatch, metrics):
+        class SpecificError(Exception):
+            pass
+
         def runner(self):
-            raise self.retry(exc=Exception())
+            raise self.retry(exc=SpecificError)
 
         request = pretend.stub(
             find_service=lambda *a, **kw: metrics,
@@ -90,7 +93,7 @@ class TestWarehouseTask:
         task.name = "warehouse.test.task"
         task.run = runner
 
-        with pytest.raises(Exception):
+        with pytest.raises(SpecificError):
             task.run(task)
 
         assert metrics.increment.calls == [
@@ -457,12 +460,20 @@ def test_make_celery_app():
 
 
 @pytest.mark.parametrize(
-    ("env", "ssl", "broker_url", "expected_url", "transport_options"),
+    (
+        "env",
+        "ssl",
+        "broker_url",
+        "broker_redis_url",
+        "expected_url",
+        "transport_options",
+    ),
     [
         (
             Environment.development,
             False,
             "amqp://guest@rabbitmq:5672//",
+            None,
             "amqp://guest@rabbitmq:5672//",
             {},
         ),
@@ -470,6 +481,7 @@ def test_make_celery_app():
             Environment.production,
             True,
             "amqp://guest@rabbitmq:5672//",
+            None,
             "amqp://guest@rabbitmq:5672//",
             {},
         ),
@@ -477,6 +489,7 @@ def test_make_celery_app():
             Environment.development,
             False,
             "sqs://",
+            None,
             "sqs://",
             {
                 "client-config": {"tcp_keepalive": True},
@@ -486,6 +499,7 @@ def test_make_celery_app():
             Environment.production,
             True,
             "sqs://",
+            None,
             "sqs://",
             {
                 "client-config": {"tcp_keepalive": True},
@@ -495,6 +509,7 @@ def test_make_celery_app():
             Environment.development,
             False,
             "sqs://?queue_name_prefix=warehouse",
+            None,
             "sqs://",
             {
                 "queue_name_prefix": "warehouse-",
@@ -505,6 +520,7 @@ def test_make_celery_app():
             Environment.production,
             True,
             "sqs://?queue_name_prefix=warehouse",
+            None,
             "sqs://",
             {
                 "queue_name_prefix": "warehouse-",
@@ -515,6 +531,7 @@ def test_make_celery_app():
             Environment.development,
             False,
             "sqs://?region=us-east-2",
+            None,
             "sqs://",
             {
                 "region": "us-east-2",
@@ -525,6 +542,7 @@ def test_make_celery_app():
             Environment.production,
             True,
             "sqs://?region=us-east-2",
+            None,
             "sqs://",
             {
                 "region": "us-east-2",
@@ -535,6 +553,7 @@ def test_make_celery_app():
             Environment.development,
             False,
             "sqs:///?region=us-east-2&queue_name_prefix=warehouse",
+            None,
             "sqs://",
             {
                 "region": "us-east-2",
@@ -546,16 +565,39 @@ def test_make_celery_app():
             Environment.production,
             True,
             "sqs:///?region=us-east-2&queue_name_prefix=warehouse",
+            None,
             "sqs://",
             {
                 "region": "us-east-2",
                 "queue_name_prefix": "warehouse-",
                 "client-config": {"tcp_keepalive": True},
             },
+        ),
+        (
+            Environment.production,
+            True,
+            "sqs:///?region=us-east-2&queue_name_prefix=warehouse",
+            "redis://127.0.0.1:6379/10",
+            "sqs://",
+            {
+                "region": "us-east-2",
+                "queue_name_prefix": "warehouse-",
+                "client-config": {"tcp_keepalive": True},
+            },
+        ),
+        (
+            Environment.production,
+            True,
+            None,
+            "redis://127.0.0.1:6379/10",
+            "redis://127.0.0.1:6379/10",
+            {},
         ),
     ],
 )
-def test_includeme(env, ssl, broker_url, expected_url, transport_options):
+def test_includeme(
+    env, ssl, broker_url, broker_redis_url, expected_url, transport_options
+):
     registry_dict = {}
     config = pretend.stub(
         action=pretend.call_recorder(lambda *a, **kw: None),
@@ -567,6 +609,7 @@ def test_includeme(env, ssl, broker_url, expected_url, transport_options):
             settings={
                 "warehouse.env": env,
                 "celery.broker_url": broker_url,
+                "celery.broker_redis_url": broker_redis_url,
                 "celery.result_url": pretend.stub(),
                 "celery.scheduler_url": pretend.stub(),
             },
